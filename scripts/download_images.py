@@ -18,17 +18,19 @@ from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 def pull_one_image(image, logger):
+    client = None
     try:
         client = docker.from_env()
         client.ping()
 
-        low_api = docker.APIClient(base_url="unix://var/run/docker.sock")
         logger.info(f"[{image}] start pull")
         start_time = datetime.now()
 
-        pull_log = low_api.pull(image, stream=True, decode=True)
+        pull_log = client.api.pull(image, stream=True, decode=True)
         last_status = None
         for line in pull_log:
+            if "error" in line or "errorDetail" in line:
+                raise RuntimeError(line.get("error") or line["errorDetail"])
             status = line.get("status", "").strip()
             if status and status != last_status:
                 logger.info(f"{image}: {status}")
@@ -40,6 +42,9 @@ def pull_one_image(image, logger):
     except Exception as e:
         logger.error(f"[{image}] pull fail: {e}")
         return False, image
+    finally:
+        if client is not None:
+            client.close()
 
 def batch_pull_images(
     images_file="images.txt",
@@ -72,13 +77,17 @@ def batch_pull_images(
         return 0, 0
 
     # Test Docker connection
+    client = None
     try:
         client = docker.from_env()
         client.ping()
-        logger.info("Docker connection success")
+        logger.info("Docker connection success; storage: %s", client.info()["DockerRootDir"])
     except Exception as e:
         logger.error(f"Docker connection fail: {e}")
         return 0, 0
+    finally:
+        if client is not None:
+            client.close()
 
     success, fail = 0, 0
 
