@@ -1,0 +1,6 @@
+path: Qwen/Qwen3.8-27B
+served_name: ${model.path}
+context_length: 65536
+output_tokens: 8192
+reasoning_parser: qwen3
+tool_call_parser: qwen3_coder

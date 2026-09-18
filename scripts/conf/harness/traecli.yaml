@@ -1,0 +1,4 @@
+name: traecli
+binary: ${oc.env:TRAE_BIN,traex}
+# Supply an existing <profile>.traecli.toml; no local provider template is generated.
+config: null

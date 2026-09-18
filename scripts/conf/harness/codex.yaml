@@ -1,0 +1,4 @@
+name: codex
+binary: ${oc.env:CODEX_BIN,codex}
+# null renders a fresh local-model config for each generation invocation.
+config: null

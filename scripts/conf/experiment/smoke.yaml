@@ -1,0 +1,7 @@
+# @package _global_
+label: local_${harness.name}_smoke
+generation:
+  limit: 1
+  concurrency: 1
+evaluation:
+  max_workers: 1

@@ -1,0 +1,59 @@
+defaults:
+  - model: qwen3_8_27b
+  - harness: codex
+  - _self_
+  - optional experiment: null
+
+# setup | serve | configure | check | generate | evaluate
+action: check
+dry_run: false
+label: local_${harness.name}
+
+paths:
+  runtime: ${oc.env:RUNTIME_DIR,${repo:}/patcheval/exp_agent/agent_runs/local_llm}
+  runs: ${repo:}/patcheval/exp_agent/agent_runs
+  dataset: ${repo:}/patcheval/datasets/patcheval_verified.json
+  serving_env: ${paths.runtime}/venv
+  hf_cache: ${oc.env:HF_HOME,${paths.runtime}/huggingface}
+  uv_cache: ${paths.runtime}/uv-cache
+  python_install: ${paths.runtime}/python
+
+server:
+  version: 0.5.19
+  python_version: '3.12'
+  gpu: '0'
+  host: null # Discover the Docker bridge gateway only when needed.
+  port: 30000
+  base_url: null # Override the client URL if different from the bind address.
+  tensor_parallel: 1
+  dtype: bfloat16
+  memory_fraction: 0.85
+  max_running_requests: 1
+  extra_args: [] # Literal argv entries, never evaluated by a shell.
+
+configure:
+  output_dir: ${paths.runtime}/harnesses
+  force: false
+
+check:
+  protocol: both
+  timeout: 300
+
+generation:
+  limit: -1
+  concurrency: 1
+  timeout: 3600
+
+evaluation:
+  run_dir: null # null selects the newest completed run matching label under paths.runs.
+  max_workers: 1
+  log_level: INFO
+
+hydra:
+  job:
+    chdir: false
+  run:
+    dir: ${absolute:${paths.runs}}/hydra/${now:%Y%m%d_%H%M%S_%f}-${action}
+  sweep:
+    dir: ${absolute:${paths.runs}}/hydra/multirun/${now:%Y%m%d_%H%M%S_%f}
+    subdir: ${hydra.job.num}
