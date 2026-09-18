@@ -48,6 +48,7 @@ class GenerationResult:
     duration_s: float
     patch_path: str
     error: str = ""
+    trajectory_path: Optional[str] = None
 
 
 def _safe_name(value: str, max_len: int = 100) -> str:
@@ -236,26 +237,68 @@ async def _run_agent(container: str, workdir: str, command_template: str, result
     }
     command = command_template.format(**values)
     started = time.monotonic()
-    proc = await asyncio.create_subprocess_exec(
-        "docker", "exec", "-w", workdir,
-        *sum((["-e", f"{k}={v}"] for k, v in env.items()), []),
-        container, "bash", "-lc", command,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        limit=STREAM_READER_LIMIT,
-    )
-    try:
-        out_b, err_b = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
+    # Direct file descriptors avoid communicate() losing buffered output when
+    # wait_for cancels it on timeout. Raw bytes remain available even on failure.
+    stdout_path = result_dir / "agent_stdout.txt"
+    stderr_path = result_dir / "agent_stderr.txt"
+    with stdout_path.open("wb") as out, stderr_path.open("wb") as err:
+        proc = await asyncio.create_subprocess_exec(
+            "docker", "exec", "-w", workdir,
+            *sum((["-e", f"{k}={v}"] for k, v in env.items()), []),
+            container, "bash", "-lc", command,
+            stdout=out, stderr=err,
+        )
         timed_out = False
-    except asyncio.TimeoutError:
-        proc.kill()
-        out_b, err_b = await proc.communicate()
-        timed_out = True
-    stdout = (out_b or b"").decode("utf-8", errors="replace")
-    stderr = (err_b or b"").decode("utf-8", errors="replace")
-    (result_dir / "agent_stdout.txt").write_text(stdout, encoding="utf-8")
-    (result_dir / "agent_stderr.txt").write_text(stderr, encoding="utf-8")
-    return CommandResult(["docker", "exec", container, "bash", "-lc", command], int(proc.returncode if proc.returncode is not None else 124), stdout, stderr, time.monotonic() - started, timed_out)
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=timeout_s)
+        except asyncio.TimeoutError:
+            timed_out = True
+            if proc.returncode is None:
+                proc.kill()
+            await proc.wait()
+        except BaseException:
+            if proc.returncode is None:
+                proc.kill()
+            await proc.wait()
+            raise
+    # Only diagnostic tails enter memory; the full streams stay on disk.
+    def tail(path):
+        with path.open("rb") as stream:
+            stream.seek(max(0, path.stat().st_size - 8192))
+            return stream.read().decode("utf-8", errors="replace")
+    return CommandResult(["docker", "exec", container, "bash", "-lc", command],
+                         int(proc.returncode if proc.returncode is not None else 124),
+                         tail(stdout_path), tail(stderr_path), time.monotonic() - started, timed_out)
+
+
+def _trajectory_spec(value: str) -> tuple[str, str]:
+    name, separator, path = value.partition("=")
+    if not separator or not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]*", name) or not path.startswith("/"):
+        raise argparse.ArgumentTypeError("trajectory path must be NAME=/absolute/container/path")
+    return name, path
+
+
+async def _archive_trajectory(container: str, work: Path, destination: Path,
+                              native_paths: list[tuple[str, str]]) -> dict[str, Any]:
+    """Freeze writers before copying session DB/WAL files; never archive homes."""
+    destination.mkdir(parents=True, exist_ok=True)
+    capture: dict[str, Any] = {"native": {}, "warnings": []}
+    for source, target in (("prompt.txt", "prompt.txt"), ("agent_stdout.txt", "stdout.jsonl"),
+                           ("agent_stderr.txt", "stderr.txt")):
+        path = work / source
+        if path.exists():
+            shutil.copyfile(path, destination / target)
+    stopped = await _run(["docker", "stop", "--time", "5", container], timeout_s=30)
+    if stopped.exit_code != 0:
+        capture["warnings"].append("Container stop failed; native session files may be incomplete: " + stopped.stderr)
+    if native_paths:
+        (destination / "native").mkdir(exist_ok=True)
+    for name, path in native_paths:
+        copied = await _run(["docker", "cp", f"{container}:{path}", str(destination / "native" / name)], timeout_s=120)
+        capture["native"][name] = {"source": path, "saved": copied.exit_code == 0}
+        if copied.exit_code != 0:
+            capture["native"][name]["error"] = copied.stderr or copied.stdout
+    return capture
 
 
 async def _collect_patch(container: str, workdir: str, result_dir: Path) -> CommandResult:
@@ -291,6 +334,12 @@ async def _run_one(sample: dict[str, Any], index: int, args: argparse.Namespace,
         work = run_root / ".work" / run_id
         work.mkdir(parents=True, exist_ok=True)
         patch_path = run_root / "patches" / f"{cve}.patch"
+        trajectory = run_root / "trajectories" / run_id if args.save_trajectories else None
+        capture = {}
+        if trajectory:
+            trajectory.mkdir(parents=True, exist_ok=True)
+            _write_json(trajectory / "metadata.json", {"schema_version": 1, "cve": cve,
+                        "index": index, "status": "running", "work_logs": str(work)})
         status = "failed"
         error = ""
         workdir = "/workspace"
@@ -321,8 +370,22 @@ async def _run_one(sample: dict[str, Any], index: int, args: argparse.Namespace,
             patch_path.write_text("", encoding="utf-8")
             _log(f"{run_id}: failed: {error}")
         finally:
-            await _remove_container(container)
-        result = GenerationResult(index, cve, instance_id, image, workdir, container, status, status == "generated", agent_result.exit_code if agent_result else None, timed_out, time.monotonic() - started, str(patch_path), error)
+            try:
+                if trajectory:
+                    capture = await _archive_trajectory(container, work, trajectory, args.trajectory_path)
+            except Exception as exc:
+                capture = {"warnings": [f"Trajectory archive failed: {exc}"], "work_logs": str(work)}
+                _log(f"{run_id}: trajectory archive failed: {exc}")
+            finally:
+                await _remove_container(container)
+        result = GenerationResult(index, cve, instance_id, image, workdir, container, status,
+                                  status == "generated", agent_result.exit_code if agent_result else None,
+                                  timed_out, time.monotonic() - started, str(patch_path), error,
+                                  str(trajectory) if trajectory else None)
+        if trajectory:
+            _write_json(trajectory / "metadata.json", {"schema_version": 1, **asdict(result),
+                        "capture": capture, "work_logs": str(work),
+                        "agent_duration_s": agent_result.duration_s if agent_result else None})
         return result
 
 
@@ -366,6 +429,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--mount", action="append", default=[])
     p.add_argument("--agent-timeout", type=int, default=DEFAULT_AGENT_TIMEOUT_S)
     p.add_argument("--container-prefix", default="patcheval-agent")
+    p.add_argument("--save-trajectories", action="store_true",
+                   help="Archive full task prompts, CLI streams, and configured native sessions")
+    p.add_argument("--trajectory-path", type=_trajectory_spec, action="append", default=[],
+                   help="Optional native session artifact NAME=/container/path (never a credential home)")
     return p
 
 

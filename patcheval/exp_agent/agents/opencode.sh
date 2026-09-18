@@ -31,3 +31,11 @@ AGENT_MOUNTS+=("${OPENCODE_BIN}:/usr/local/bin/opencode:ro")
 AGENT_MOUNTS+=("${OPENCODE_CONFIG_HOME}:/opt/opencode-config-src:ro")
 AGENT_MOUNTS+=("${OPENCODE_DATA_HOME}:/opt/opencode-data-src:ro")
 AGENT_COMMAND='rm -rf /tmp/opencode-config /tmp/opencode-data && mkdir -p /tmp/opencode-config /tmp/opencode-data && cp -a /opt/opencode-config-src/. /tmp/opencode-config/ && cp -a /opt/opencode-data-src/. /tmp/opencode-data/ && XDG_CONFIG_HOME=/tmp/opencode-config XDG_DATA_HOME=/tmp/opencode-data opencode run --format json --auto < {prompt_file}'
+
+# Export session records only; never copy credential-bearing runtime homes.
+AGENT_TRAJECTORY_PATHS=(
+  "opencode.db=/tmp/opencode-data/opencode/opencode.db"
+  "opencode.db-wal=/tmp/opencode-data/opencode/opencode.db-wal"
+  "opencode.db-shm=/tmp/opencode-data/opencode/opencode.db-shm"
+  "opencode_storage=/tmp/opencode-data/opencode/storage"
+)

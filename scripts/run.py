@@ -39,6 +39,8 @@ def positive(value, name):
 def validate(cfg):
     if cfg.action not in {"setup", "serve", "configure", "check", "generate", "evaluate"}:
         raise ValueError("action must be setup, serve, configure, check, generate, or evaluate")
+    if not isinstance(cfg.generation.save_trajectories, bool):
+        raise ValueError("generation.save_trajectories must be a boolean")
     if cfg.harness.name not in {"codex", "opencode", "traecli"}:
         raise ValueError("Unknown harness")
     if not isinstance(cfg.label, str) or len(cfg.label) > 100 or not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]*", cfg.label):
@@ -155,7 +157,8 @@ def generation_job(cfg, output):
     env = {f"{prefix}_BIN": binary, f"{prefix}_CONFIG": str(config),
            "DATASET": str(absolute(cfg.paths.dataset)), "OUTPUT_BASE": str(output / "generation"),
            "LIMIT": str(cfg.generation.limit), "CONCURRENCY": str(cfg.generation.concurrency),
-           "AGENT_TIMEOUT": str(cfg.generation.timeout)}
+           "AGENT_TIMEOUT": str(cfg.generation.timeout),
+           "SAVE_TRAJECTORIES": str(cfg.generation.save_trajectories).lower()}
     return ["bash", str(ROOT / "patcheval/exp_agent/run_infer.sh"), cfg.harness.name, cfg.label], env
 
 

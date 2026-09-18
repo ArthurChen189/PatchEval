@@ -64,3 +64,8 @@ AGENT_MOUNTS=(
 )
 AGENT_EXTRA_ARGS=()
 AGENT_COMMAND="rm -rf /tmp/codex-home && cp -a /opt/codex-home-src /tmp/codex-home && CODEX_HOME=/tmp/codex-home /usr/local/bin/codex exec --profile ${CODEX_PROFILE} --json --dangerously-bypass-approvals-and-sandbox -C {workdir} < {prompt_file}"
+
+# Export session records only; never copy credential-bearing runtime homes.
+AGENT_TRAJECTORY_PATHS=(
+  "codex_sessions=/tmp/codex-home/sessions"
+)

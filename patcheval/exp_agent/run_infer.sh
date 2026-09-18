@@ -15,6 +15,7 @@ if [[ ! -f "$AGENT_FILE" ]]; then
   exit 2
 fi
 
+AGENT_TRAJECTORY_PATHS=()
 # shellcheck source=/dev/null
 source "$AGENT_FILE"
 
@@ -26,6 +27,18 @@ for mount in "${AGENT_MOUNTS[@]:-}"; do
   mount_args+=(--mount "$mount")
 done
 
+trajectory_args=()
+case "${SAVE_TRAJECTORIES:-false}" in
+  true|1)
+    trajectory_args+=(--save-trajectories)
+    for path in "${AGENT_TRAJECTORY_PATHS[@]}"; do
+      trajectory_args+=(--trajectory-path "$path")
+    done
+    ;;
+  false|0) ;;
+  *) echo "SAVE_TRAJECTORIES must be true/false or 1/0" >&2; exit 2 ;;
+esac
+
 python "${SCRIPT_DIR}/patch_agent_runner.py" \
   --input "$DATASET" \
   --output-dir "$OUTPUT_BASE" \
@@ -34,6 +47,7 @@ python "${SCRIPT_DIR}/patch_agent_runner.py" \
   --run-label "$PREFIX" \
   "${mount_args[@]}" \
   "${AGENT_EXTRA_ARGS[@]}" \
+  "${trajectory_args[@]}" \
   --agent-command "$AGENT_COMMAND" \
   --agent-timeout "${AGENT_TIMEOUT:-3600}" \
   --container-prefix "patcheval-${AGENT}"

@@ -42,7 +42,7 @@ class HydraWorkflowTests(unittest.TestCase):
             self.assertTrue((Path(tmp) / 'record/resolved.yaml').exists())
 
     def test_serving_command_preserves_literal_arguments(self):
-        cfg = config('server.host=127.0.0.1')
+        cfg = config('server.host=127.0.0.1', 'model.context_length=65536')
         cfg.model.path = '/models/path with spaces'
         cfg.server.extra_args = ['--json-model-override-args', '{"literal":"$(touch /tmp/not-executed)"}']
         command = workflow.serve_command(cfg)
@@ -64,6 +64,11 @@ class HydraWorkflowTests(unittest.TestCase):
             self.assertEqual(kwargs['env']['LIMIT'], '1')
             self.assertEqual(kwargs['env']['CONCURRENCY'], '1')
             self.assertEqual(kwargs['env']['AGENT_TIMEOUT'], '42')
+            self.assertEqual(kwargs['env']['SAVE_TRAJECTORIES'], 'true')
+            cfg.generation.save_trajectories = False
+            cfg.dry_run = True
+            _, disabled_env = workflow.generation_job(cfg, Path(tmp))
+            self.assertEqual(disabled_env['SAVE_TRAJECTORIES'], 'false')
             self.assertEqual(kwargs['env']['OUTPUT_BASE'], str(Path(tmp) / 'hydra job/generation'))
             self.assertTrue(Path(kwargs['env']['OPENCODE_CONFIG']).is_file())
             self.assertEqual(kwargs['cwd'], ROOT)
@@ -117,7 +122,7 @@ class HydraWorkflowTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'No completed'):
                 workflow.find_run(cfg)
         for override in ('generation.concurrency=0', 'generation.limit=0', 'server.port=70000',
-                         'model.output_tokens=65536', 'label=../unsafe', 'check.protocol=invalid'):
+                         'model.output_tokens=999999', 'generation.save_trajectories=invalid', 'label=../unsafe', 'check.protocol=invalid'):
             with self.subTest(override=override), self.assertRaises(ValueError):
                 workflow.validate(config(override))
 

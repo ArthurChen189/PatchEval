@@ -43,6 +43,7 @@ generation:
   limit: -1
   concurrency: 1
   timeout: 3600
+  save_trajectories: true # Preserve per-task prompts, events, stderr, and native sessions.
 
 evaluation:
   run_dir: null # null selects the newest completed run matching label under paths.runs.
