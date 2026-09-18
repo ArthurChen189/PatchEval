@@ -128,6 +128,41 @@ Other model families may need different parsers. The service is unauthenticated
 by default; keep it on the local bridge or configure authentication in both the
 server and supplied harness configs.
 
+### Saving per-task trajectories
+
+`generation.save_trajectories=true` is enabled in `scripts/conf/config.yaml`.
+Override with `generation.save_trajectories=false` to disable the analysis
+archives. The underlying Bash runner also accepts `SAVE_TRAJECTORIES=true`,
+and the Python runner accepts `--save-trajectories` (off by default when used
+directly).
+
+Each generation run saves `trajectories/<index>-patcheval_<CVE>/` containing
+`prompt.txt`, `stdout.jsonl`, `stderr.txt`, and `metadata.json`. `stdout.jsonl`
+is the unmodified harness JSON event stream: model messages, tool calls/results,
+and any reasoning events the harness emits. No events are filtered or truncated;
+custom non-JSON agent commands retain their raw output as well. This captures
+what the harness exposes, not model internals unavailable through its interface.
+The CLI streams are continuously written to `.work/<task>/agent_stdout.txt`
+and `agent_stderr.txt`, then archived when the task ends, including nonzero
+exits and timeouts. `results.jsonl` links each task via `trajectory_path`.
+Metadata includes the task outcome, exit code, timeout, agent duration, native
+capture status, and the original work-log path if archival encounters an error.
+
+Before deleting a case container, trajectory capture stops its writers and
+copies available native session records: Codex `sessions/`, and OpenCode's
+SQLite database plus WAL/SHM files (or legacy `storage/`). Keep SQLite files
+together when opening an archived database; use a working copy for analysis.
+Only these session paths are exported, never entire credential-bearing homes.
+TraeCLI retains its JSON output stream; no native session export is configured.
+Missing optional native files are recorded in metadata. These artifacts live
+under ignored generation outputs. Disabling archives retains the existing
+`.work` prompt/stdout/stderr diagnostics, including partial timeout output.
+
+```bash
+bash scripts/run.sh action=generate experiment=smoke harness=codex \
+  generation.save_trajectories=true
+```
+
 ### Harness configuration, generation, and evaluation
 
 Generation automatically renders fresh Codex/OpenCode configs in its Hydra
