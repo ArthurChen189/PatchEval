@@ -20,13 +20,13 @@ def configure(output, base_url, model, context, force=False, output_tokens=8192)
     base_url = base_url.rstrip("/")
     quote = json.dumps  # Basic TOML strings share JSON escaping for these values.
     config = f'''model = {quote(model)}
-model_provider = "sglang"
+model_provider = "vllm"
 model_context_window = {context}
 model_auto_compact_token_limit = {context - output_tokens}
 web_search = "disabled"
 
-[model_providers.sglang]
-name = "Local SGLang"
+[model_providers.vllm]
+name = "Local vLLM"
 base_url = {quote(base_url)}
 wire_api = "responses"
 requires_openai_auth = false
@@ -35,11 +35,11 @@ supports_websockets = false
 '''
     opencode = {
         "$schema": "https://opencode.ai/config.json",
-        "model": f"sglang/{model}",
-        "small_model": f"sglang/{model}",
+        "model": f"vllm/{model}",
+        "small_model": f"vllm/{model}",
         "permission": "allow",
-        "provider": {"sglang": {
-            "npm": "@ai-sdk/openai-compatible", "name": "Local SGLang",
+        "provider": {"vllm": {
+            "npm": "@ai-sdk/openai-compatible", "name": "Local vLLM",
             "options": {"baseURL": base_url, "apiKey": "local"},
             "models": {model: {"name": model,
                                "limit": {"context": context, "output": output_tokens}}},

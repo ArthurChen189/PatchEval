@@ -52,7 +52,7 @@ Keep credentials, runtime homes, and generated logs outside version control. Do 
 
 Use `bash scripts/run.sh` (or `uv run python scripts/run.py`) for the new
 workflow commands. `hydra-core` is included in both `pyproject.toml`/`uv.lock`
-and `requirements.txt`. SGLang stays in a separate uv-managed environment.
+and `requirements.txt`. vLLM stays in a separate uv-managed environment.
 Generation and evaluation remain separate actions; the underlying adapters,
 runner, dataset, and evaluator retain their existing interfaces.
 
@@ -87,42 +87,58 @@ control. `dry_run=true` saves configuration and prints the intended operation
 without installing, serving, rendering harness homes, or running the benchmark.
 Endpoint auto-discovery still requires Docker unless an explicit address is set.
 
-### Local SGLang inference on H200
+### Local vLLM inference on H200
 
-The default `model=qwen3_8_27b` serves `Qwen/Qwen3.8-27B` in BF16 with one GPU,
-a 65,536-token context, `server.memory_fraction=0.85`, and one active request.
-Thinking uses the checkpoint defaults. The `qwen3` reasoning and `qwen3_coder`
-tool parsers are enabled. SGLang is pinned to 0.5.19; setup allows its prerelease
-dependencies and uses managed Python 3.12 with the development headers required
+The default `model=qwen3_8_27b` serves `Qwen/Qwen3.8-27B` in BF16 with
+`--tensor-parallel-size 1` and `--data-parallel-size 8` on eight H200s (the 27B checkpoint fits on one
+GPU, so data parallel replicas raise throughput instead of tensor-sharding the
+weights), a 262,144-token context, `server.memory_fraction=0.85`, and one active request
+per replica (`--max-num-seqs 1`). vLLM balances requests across replicas behind
+one endpoint. Automatic tool choice is enabled.
+Thinking uses the checkpoint defaults. The `qwen3` reasoning and `qwen3_xml`
+tool parsers are enabled. vLLM is pinned to 0.29.0; setup uses managed Python 3.12 with the development headers required
 by Triton. Serving needs a C compiler and a compatible CUDA toolkit; initial
 kernel compilation can take minutes. See the
-[SGLang Qwen3.8 recipe](https://docs.sglang.io/cookbook/autoregressive/Qwen/Qwen3.8-27B).
+[vLLM Qwen3.8 recipe](https://recipes.vllm.ai/Qwen/Qwen3.8-27B).
 
 Choose storage with room for approximately 54 GB of weights, the environment,
 and caches. Keep these settings in an experiment YAML or use overrides:
 
 ```bash
 bash scripts/run.sh action=setup paths.runtime=/mnt/local/patcheval-local-llm
-bash scripts/run.sh action=serve paths.runtime=/mnt/local/patcheval-local-llm
+bash scripts/run.sh action=serve paths.runtime=/mnt/local/patcheval-local-llm server.host=172.17.0.1
 # In another terminal:
-bash scripts/run.sh action=check
+bash scripts/run.sh action=check server.host=172.17.0.1
 ```
 
+Setup creates `${paths.runtime}/venv-vllm`, leaving the previous SGLang `venv`
+untouched and reusing the configured Hugging Face cache. The explicit host above
+avoids Docker socket access during serving; generation still requires Docker.
+New harness profiles use provider ID `vllm`; regenerate reusable profiles or
+update custom profiles yourself. `serve_sglang.sh` remains a deprecated forwarding
+alias to `serve_vllm.sh`.
+
+The migration is validated with unit tests and dry runs only. Live startup,
+eight-replica GPU memory checks, streaming protocol checks, and a one-case
+benchmark smoke test remain pending until a server is explicitly started.
+
 `serve` stays in the foreground and forwards signals by replacing the launcher
-with SGLang. It records the installed serving version in `server-version.json`
+with vLLM. It records the installed serving version in `server-version.json`
 next to the resolved configuration. Redirect console output to a runtime log
 when needed. `server.host=null` discovers the Docker bridge gateway; port
 30000 is the default. Container localhost is not the host. For a different
 endpoint set `server.host`, `server.port`, or `server.base_url` (client URL,
 including `/v1`). `check.protocol=both|chat|responses` and `check.timeout=300`
 control the streaming tool-call/result probes. Codex uses Responses and
-OpenCode uses Chat Completions; no proxy is installed. `SGLANG_API_KEY` remains
-the optional check credential environment variable.
+OpenCode uses Chat Completions; no proxy is installed. `VLLM_API_KEY` is the optional
+credential for serving and checks; checks accept `SGLANG_API_KEY` as a deprecated
+fallback, with `VLLM_API_KEY` taking precedence. Configure matching credentials
+in custom harness profiles when authentication is enabled.
 
 Model path/name, context/output limits, and parsers live in the model YAML.
-GPU selection, tensor parallelism, dtype, memory, and concurrency live in
+GPU selection, tensor/data parallelism, dtype, memory, and concurrency live in
 `server`. Extra serving arguments are literal list entries, for example
-`'server.extra_args=[--attention-backend,fa3]'`. Prefer named configuration
+`'server.extra_args=[--enforce-eager]'`. Prefer named configuration
 fields for settings already exposed so the server and harnesses stay aligned.
 Other model families may need different parsers. The service is unauthenticated
 by default; keep it on the local bridge or configure authentication in both the
@@ -252,7 +268,7 @@ on a shared GPU/port.
 The existing script names are thin Hydra aliases:
 
 ```bash
-bash scripts/infer/serve_sglang.sh serve server.gpu=0
+bash scripts/infer/serve_vllm.sh serve server.gpu=0 server.data_parallel=1
 uv run python scripts/infer/configure_harnesses.py configure.force=true
 uv run python scripts/infer/check_server.py check.protocol=responses
 bash scripts/generate_patches.sh experiment=smoke harness=codex label=my_run
@@ -269,11 +285,11 @@ explicit Hydra overrides take precedence. The lower-level
 environment-based interfaces.
 
 Use `experiment=full` and a distinct label after reviewing smoke outputs.
-Increase `generation.concurrency` and `server.max_running_requests` together
-only after measuring GPU memory. The existing end-to-end verified dataset is
-unchanged; no new partition is introduced. An unsuccessful repair is not an
-infrastructure failure. Keep reference patches and fix metadata out of repair
-prompts and tools.
+Increase `generation.concurrency` with `server.data_parallel` and
+`server.max_running_requests` only after measuring GPU memory. The existing
+end-to-end verified dataset is unchanged; no new partition is introduced. An
+unsuccessful repair is not an infrastructure failure. Keep reference patches
+and fix metadata out of repair prompts and tools.
 
 ## Docker storage on the ephemeral disk
 

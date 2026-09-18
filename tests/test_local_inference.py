@@ -1,6 +1,7 @@
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
 import tempfile
 import tomllib
@@ -27,13 +28,13 @@ class ConfigTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix='local inference ') as directory:
             output = configs.configure(directory, 'http://172.17.0.1:30000/v1/', 'Qwen/Qwen3.8-27B', 65536)
             codex = tomllib.loads((output / 'codex/config.toml').read_text())
-            self.assertEqual(codex['model_provider'], 'sglang')
+            self.assertEqual(codex['model_provider'], 'vllm')
             self.assertNotIn('profiles', codex)
-            self.assertEqual(codex['model_providers']['sglang']['wire_api'], 'responses')
+            self.assertEqual(codex['model_providers']['vllm']['wire_api'], 'responses')
             self.assertEqual(codex['model_auto_compact_token_limit'], 57344)
             self.assertEqual((output / 'codex/local.config.toml').read_text(), (output / 'codex/config.toml').read_text())
             opencode = json.loads((output / 'opencode/config/opencode/opencode.json').read_text())
-            self.assertEqual(opencode['model'], 'sglang/Qwen/Qwen3.8-27B')
+            self.assertEqual(opencode['model'], 'vllm/Qwen/Qwen3.8-27B')
             self.assertTrue((output / 'opencode/data').is_dir())
             with self.assertRaises(FileExistsError):
                 configs.configure(directory, 'http://host/v1', 'different', 65536)
@@ -50,6 +51,14 @@ class ConfigTests(unittest.TestCase):
 
 
 class ProtocolTests(unittest.TestCase):
+    def test_check_credentials_precedence_and_fallback(self):
+        for environment, expected in (({'VLLM_API_KEY': 'new', 'SGLANG_API_KEY': 'old'}, 'Bearer new'),
+                                      ({'SGLANG_API_KEY': 'old'}, 'Bearer old'), ({}, None)):
+            with self.subTest(environment=environment), patch.dict(os.environ, environment, clear=True), \
+                 patch.object(checks.urllib.request, 'urlopen') as request:
+                checks.Client('http://host/v1', 300).request('/models')
+                self.assertEqual(request.call_args.args[0].get_header('Authorization'), expected)
+
     def test_sse_comments_crlf_and_done(self):
         stream = io.BytesIO(b': ping\r\nevent: delta\r\ndata: {"delta":"ok"}\r\n\r\ndata: [DONE]\n\n')
         self.assertEqual(list(checks.sse_events(stream)), [{'delta': 'ok'}])

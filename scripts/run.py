@@ -46,8 +46,8 @@ def validate(cfg):
     if not isinstance(cfg.label, str) or len(cfg.label) > 100 or not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]*", cfg.label):
         raise ValueError("label must be <= 100 characters, start with a letter, digit, or underscore, and contain no path separators")
     for key in ("model.context_length", "model.output_tokens", "server.port", "server.tensor_parallel",
-                "server.max_running_requests", "generation.concurrency", "generation.timeout",
-                "evaluation.max_workers"):
+                "server.data_parallel", "server.max_running_requests", "generation.concurrency",
+                "generation.timeout", "evaluation.max_workers"):
         positive(OmegaConf.select(cfg, key), key)
     if cfg.model.output_tokens >= cfg.model.context_length:
         raise ValueError("model.output_tokens must be smaller than model.context_length")
@@ -102,16 +102,19 @@ def serving_environment(cfg):
 
 
 def serve_command(cfg):
-    args = [str(absolute(cfg.paths.serving_env) / "bin/python"), "-m", "sglang.launch_server",
-            "--model-path", cfg.model.path, "--served-model-name", cfg.model.served_name,
+    args = [str(absolute(cfg.paths.serving_env) / "bin/vllm"), "serve", cfg.model.path,
+            "--served-model-name", cfg.model.served_name,
             "--host", bind_host(cfg), "--port", str(cfg.server.port),
-            "--tp-size", str(cfg.server.tensor_parallel), "--dtype", cfg.server.dtype,
-            "--context-length", str(cfg.model.context_length),
-            "--mem-fraction-static", str(cfg.server.memory_fraction),
-            "--max-running-requests", str(cfg.server.max_running_requests)]
+            "--tensor-parallel-size", str(cfg.server.tensor_parallel),
+            "--data-parallel-size", str(cfg.server.data_parallel), "--dtype", cfg.server.dtype,
+            "--max-model-len", str(cfg.model.context_length),
+            "--gpu-memory-utilization", str(cfg.server.memory_fraction),
+            "--max-num-seqs", str(cfg.server.max_running_requests)]
     for key, flag in (("reasoning_parser", "--reasoning-parser"), ("tool_call_parser", "--tool-call-parser")):
         if cfg.model[key]:
             args.extend([flag, cfg.model[key]])
+    if cfg.model.tool_call_parser:
+        args.append("--enable-auto-tool-choice")
     return args + list(cfg.server.extra_args)
 
 
@@ -202,7 +205,7 @@ def dispatch(cfg, output):
         commands = []
         if not python.is_file():
             commands.append(["uv", "venv", "--managed-python", "--python", str(cfg.server.python_version), str(python.parent.parent)])
-        commands.append(["uv", "pip", "install", "--prerelease=allow", "--python", str(python), f"sglang=={cfg.server.version}"])
+        commands.append(["uv", "pip", "install", "--python", str(python), f"vllm=={cfg.server.version}"])
         save_config(cfg, output)
         for command in commands:
             run_command(command, serving_environment(cfg), cfg)
@@ -213,15 +216,15 @@ def dispatch(cfg, output):
         if cfg.dry_run:
             run_command(command, env, cfg)
             return
-        python = Path(command[0])
-        if not python.is_file():
+        python = absolute(cfg.paths.serving_env) / "bin/python"
+        if not python.is_file() or not os.access(command[0], os.X_OK):
             raise ValueError("Run action=setup first, or set paths.serving_env")
         if not shutil.which("cc") or not shutil.which("nvidia-smi"):
             raise ValueError("Serving requires a C compiler and nvidia-smi")
         subprocess.run(["nvidia-smi", f"--id={cfg.server.gpu}", "--query-gpu=name,memory.total,memory.free", "--format=csv"], check=True)
-        subprocess.run([str(python), "-c", 'import sglang, pathlib, sysconfig; assert (pathlib.Path(sysconfig.get_path("include")) / "Python.h").exists(), "Python development headers are required"'], check=True)
-        version = subprocess.check_output([str(python), "-c", 'import importlib.metadata; print(importlib.metadata.version("sglang"))'], text=True).strip()
-        (output / "server-version.json").write_text(json.dumps({"sglang": version}) + "\n")
+        subprocess.run([str(python), "-c", 'import vllm, pathlib, sysconfig; assert (pathlib.Path(sysconfig.get_path("include")) / "Python.h").exists(), "Python development headers are required"'], check=True)
+        version = subprocess.check_output([str(python), "-c", 'import importlib.metadata; print(importlib.metadata.version("vllm"))'], text=True).strip()
+        (output / "server-version.json").write_text(json.dumps({"vllm": version}) + "\n")
         logging.shutdown()
         os.execvpe(command[0], command, {**os.environ, **env})
     elif cfg.action == "configure":

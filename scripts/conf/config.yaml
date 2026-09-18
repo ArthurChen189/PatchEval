@@ -13,22 +13,23 @@ paths:
   runtime: ${oc.env:RUNTIME_DIR,${repo:}/patcheval/exp_agent/agent_runs/local_llm} # Local LLM home (venv, caches, ~54 GB); RUNTIME_DIR or Hydra override.
   runs: ${repo:}/patcheval/exp_agent/agent_runs # Hydra jobs and generation runs; evaluation searches here when run_dir is null.
   dataset: ${repo:}/patcheval/datasets/patcheval_verified.json # 230 verified CVE cases for generation and evaluation.
-  serving_env: ${paths.runtime}/venv # Isolated uv venv with pinned SGLang; created by action=setup.
+  serving_env: ${paths.runtime}/venv-vllm # Isolated uv venv with pinned vLLM; created by action=setup.
   hf_cache: ${oc.env:HF_HOME,${paths.runtime}/huggingface} # Hugging Face model cache; HF_HOME or Hydra override.
   uv_cache: ${paths.runtime}/uv-cache # uv download cache used during setup (UV_CACHE_DIR).
   python_install: ${paths.runtime}/python # Managed CPython 3.12 plus headers required by Triton.
 
 server:
-  version: 0.5.19
+  version: 0.29.0
   python_version: '3.12'
-  gpu: '0'
+  gpu: '0,1,2,3,4,5,6,7' # CUDA_VISIBLE_DEVICES; 8 H200s for data-parallel replicas.
   host: null # Discover the Docker bridge gateway only when needed.
   port: 30000
   base_url: null # Override the client URL if different from the bind address.
-  tensor_parallel: 1
+  tensor_parallel: 1 # 27B BF16 fits on one H200; do not shard the model.
+  data_parallel: 8 # One full replica per GPU (--data-parallel-size); better throughput than TP.
   dtype: bfloat16
   memory_fraction: 0.85
-  max_running_requests: 1
+  max_running_requests: 1 # Per replica; raise with generation.concurrency after smoke.
   extra_args: [] # Literal argv entries, never evaluated by a shell.
 
 configure:

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Example: serve_sglang.sh serve server.gpu=0 paths.runtime=/mnt/local/llm
+# Example: serve_vllm.sh serve server.gpu=0 server.data_parallel=1 paths.runtime=/mnt/local/llm
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 case "${1:---help}" in

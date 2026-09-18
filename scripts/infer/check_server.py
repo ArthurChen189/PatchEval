@@ -41,8 +41,10 @@ class Client:
 
     def request(self, endpoint, payload=None):
         headers = {"Content-Type": "application/json"}
-        if os.environ.get("SGLANG_API_KEY"):
-            headers["Authorization"] = "Bearer " + os.environ["SGLANG_API_KEY"]
+        # SGLANG_API_KEY remains a deprecated compatibility fallback.
+        api_key = os.environ.get("VLLM_API_KEY") or os.environ.get("SGLANG_API_KEY")
+        if api_key:
+            headers["Authorization"] = "Bearer " + api_key
         req = urllib.request.Request(self.base_url + endpoint,
                                      data=None if payload is None else json.dumps(payload).encode(),
                                      headers=headers)

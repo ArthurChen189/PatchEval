@@ -3,4 +3,4 @@ served_name: ${model.path}
 context_length: 262144 # max context length is 262144
 output_tokens: 8192
 reasoning_parser: qwen3
-tool_call_parser: qwen3_coder
+tool_call_parser: qwen3_xml

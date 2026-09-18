@@ -49,18 +49,92 @@ class HydraWorkflowTests(unittest.TestCase):
             opencode = json.loads((home / 'opencode/config/opencode/opencode.json').read_text())
             self.assertEqual(codex['model'], cfg.model.served_name)
             self.assertEqual(codex['model_auto_compact_token_limit'], 28672)
-            self.assertEqual(opencode['provider']['sglang']['models']['local-model']['limit'],
+            self.assertEqual(opencode['provider']['vllm']['models']['local-model']['limit'],
                              {'context': 32768, 'output': 4096})
             self.assertTrue((Path(tmp) / 'record/resolved.yaml').exists())
 
     def test_serving_command_preserves_literal_arguments(self):
         cfg = config('server.host=127.0.0.1', 'model.context_length=65536')
         cfg.model.path = '/models/path with spaces'
-        cfg.server.extra_args = ['--json-model-override-args', '{"literal":"$(touch /tmp/not-executed)"}']
+        cfg.server.extra_args = ['--hf-overrides', '{"literal":"$(touch /tmp/not-executed)"}']
         command = workflow.serve_command(cfg)
-        self.assertEqual(command[command.index('--model-path') + 1], cfg.model.path)
+        self.assertEqual(command[2], cfg.model.path)
         self.assertEqual(command[-2:], list(cfg.server.extra_args))
-        self.assertEqual(command[command.index('--context-length') + 1], '65536')
+        self.assertEqual(command[command.index('--max-model-len') + 1], '65536')
+        self.assertEqual(command[command.index('--tensor-parallel-size') + 1], '1')
+        self.assertEqual(command[command.index('--data-parallel-size') + 1], '8')
+
+    def test_vllm_defaults_and_parallel_overrides(self):
+        cfg = config('server.host=127.0.0.1')
+        command = workflow.serve_command(cfg)
+        self.assertEqual(command[:3], [str(workflow.absolute(cfg.paths.serving_env) / 'bin/vllm'),
+                                     'serve', 'Qwen/Qwen3.8-27B'])
+        for flag, value in {'--max-model-len': '262144', '--gpu-memory-utilization': '0.85',
+                            '--max-num-seqs': '1', '--reasoning-parser': 'qwen3',
+                            '--tool-call-parser': 'qwen3_xml'}.items():
+            self.assertEqual(command[command.index(flag) + 1], value)
+        self.assertIn('--enable-auto-tool-choice', command)
+        self.assertEqual(workflow.serving_environment(cfg)['CUDA_VISIBLE_DEVICES'], '0,1,2,3,4,5,6,7')
+        cfg.server.tensor_parallel, cfg.server.data_parallel = 2, 4
+        cfg.model.tool_call_parser = None
+        command = workflow.serve_command(cfg)
+        self.assertEqual(command[command.index('--tensor-parallel-size') + 1], '2')
+        self.assertEqual(command[command.index('--data-parallel-size') + 1], '4')
+        self.assertNotIn('--enable-auto-tool-choice', command)
+
+    def test_serving_dry_runs_never_execute(self):
+        for action in ('setup', 'serve'):
+            with self.subTest(action=action), tempfile.TemporaryDirectory() as tmp:
+                cfg = config(f'action={action}', 'dry_run=true', 'server.host=127.0.0.1')
+                cfg.paths.runtime = tmp
+                with patch.object(workflow.subprocess, 'run', side_effect=AssertionError('execution')), \
+                     patch.object(workflow.subprocess, 'check_output', side_effect=AssertionError('probe')), \
+                     patch.object(workflow.os, 'execvpe', side_effect=AssertionError('launch')), \
+                     contextlib.redirect_stdout(io.StringIO()) as output:
+                    workflow.dispatch(cfg, Path(tmp) / 'record')
+                self.assertIn('vllm', output.getvalue())
+                self.assertFalse((Path(tmp) / 'venv-vllm').exists())
+
+    def test_serve_records_version_and_executes_with_environment(self):
+        cfg = config('action=serve', 'server.host=127.0.0.1')
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg.paths.runtime = tmp
+            binary_dir = Path(tmp) / 'venv-vllm/bin'
+            binary_dir.mkdir(parents=True)
+            (binary_dir / 'python').touch()
+            (binary_dir / 'vllm').touch()
+            (binary_dir / 'vllm').chmod(0o755)
+            with patch.object(workflow.shutil, 'which', return_value='/usr/bin/tool'), \
+                 patch.object(workflow.subprocess, 'run') as execute, \
+                 patch.object(workflow.subprocess, 'check_output', return_value='0.29.0\n'), \
+                 patch.object(workflow.logging, 'shutdown'), \
+                 patch.object(workflow.os, 'execvpe') as launch:
+                workflow.dispatch(cfg, Path(tmp) / 'record')
+            self.assertIn('import vllm', execute.call_args.args[0][-1])
+            self.assertEqual(json.loads((Path(tmp) / 'record/server-version.json').read_text()),
+                             {'vllm': '0.29.0'})
+            self.assertEqual(launch.call_args.args[0], str(binary_dir / 'vllm'))
+            self.assertEqual(launch.call_args.args[2]['CUDA_VISIBLE_DEVICES'], '0,1,2,3,4,5,6,7')
+
+    def test_serve_requires_setup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = config('action=serve', 'server.host=127.0.0.1')
+            cfg.paths.runtime = tmp
+            with self.assertRaisesRegex(ValueError, 'action=setup'):
+                workflow.dispatch(cfg, Path(tmp) / 'record')
+
+    def test_shell_serving_aliases_forward_arguments(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / 'infer').mkdir()
+            (root / 'run.sh').write_text('printf "%s\\n" "$@"\n')
+            for name in ('serve_vllm.sh', 'serve_sglang.sh'):
+                (root / 'infer' / name).write_text((ROOT / 'scripts/infer' / name).read_text())
+            for name in ('serve_vllm.sh', 'serve_sglang.sh'):
+                result = subprocess.run(['bash', str(root / 'infer' / name), 'serve',
+                                         'dry_run=true', 'server.gpu=0,1'], capture_output=True, text=True, check=True)
+                self.assertEqual(result.stdout.splitlines(), ['dry_run=true', 'server.gpu=0,1', 'action=serve'])
+                self.assertEqual('deprecated' in result.stderr, name == 'serve_sglang.sh')
 
     def test_generate_uses_config_instead_of_ambient_runner_settings(self):
         cfg = config('action=generate', 'experiment=smoke', 'harness=opencode',
@@ -176,8 +250,8 @@ class HydraWorkflowTests(unittest.TestCase):
             self.assertEqual(execute.call_count, 2)
             commands = [call.args[0] for call in execute.call_args_list]
             self.assertIn('--managed-python', commands[0])
-            self.assertIn(str(Path(tmp) / 'venv/bin/python'), commands[1])
-            self.assertEqual(commands[1][-1], 'sglang==0.5.19')
+            self.assertIn(str(Path(tmp) / 'venv-vllm/bin/python'), commands[1])
+            self.assertEqual(commands[1][-1], 'vllm==0.29.0')
 
     def test_config_inspection_works_from_another_directory_without_execution(self):
         with tempfile.TemporaryDirectory() as tmp:
