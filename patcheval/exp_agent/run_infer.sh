@@ -9,6 +9,8 @@ fi
 AGENT="$1"
 PREFIX="${2:-$AGENT}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+cd "$REPO_ROOT"
 AGENT_FILE="${SCRIPT_DIR}/agents/${AGENT}.sh"
 if [[ ! -f "$AGENT_FILE" ]]; then
   echo "Unknown agent '$AGENT'; expected one of: codex opencode traecli" >&2
@@ -20,7 +22,7 @@ AGENT_TRAJECTORY_PATHS=()
 source "$AGENT_FILE"
 
 DATASET="${DATASET:-${SCRIPT_DIR}/../datasets/patcheval_verified.json}"
-OUTPUT_BASE="${OUTPUT_BASE:-${SCRIPT_DIR}/agent_runs}"
+OUTPUT_BASE="${OUTPUT_BASE:-${RUNS_DIR:-${SCRIPT_DIR}/agent_runs}}"
 
 mount_args=()
 for mount in "${AGENT_MOUNTS[@]:-}"; do

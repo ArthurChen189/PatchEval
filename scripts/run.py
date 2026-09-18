@@ -199,7 +199,7 @@ def run_command(command, overrides, cfg, cwd=ROOT):
 
 def dispatch(cfg, output):
     validate(cfg)
-    output = Path(output)
+    output = absolute(output)
     if cfg.action == "setup":
         python = absolute(cfg.paths.serving_env) / "bin/python"
         commands = []
@@ -228,6 +228,8 @@ def dispatch(cfg, output):
         logging.shutdown()
         os.execvpe(command[0], command, {**os.environ, **env})
     elif cfg.action == "configure":
+        cfg.configure.output_dir = str(absolute(cfg.configure.output_dir) if cfg.configure.output_dir
+                                       else output / "harnesses")
         url = endpoint(cfg)
         save_config(cfg, output)
         if cfg.dry_run:
@@ -280,6 +282,9 @@ def main(cfg: DictConfig):
 
 
 def entrypoint(action=None):
+    # Hydra resolves explicit relative run/sweep directories before dispatch.
+    # Anchor its initialization as well as our own paths at the repository root.
+    os.chdir(ROOT)
     if action:
         sys.argv.append(f"action={action}")
     main()

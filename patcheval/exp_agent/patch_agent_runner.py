@@ -15,10 +15,12 @@ import re
 import shlex
 import shutil
 import time
+import tempfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Optional
 
+ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_AGENT_TIMEOUT_S = 3600
 STREAM_READER_LIMIT = 16 * 1024 * 1024
 
@@ -390,11 +392,17 @@ async def _run_one(sample: dict[str, Any], index: int, args: argparse.Namespace,
 
 
 async def _main(args: argparse.Namespace) -> int:
-    samples = _read_json(Path(args.input))
+    input_path = Path(args.input).expanduser()
+    samples = _read_json(input_path if input_path.is_absolute() else ROOT / input_path)
     indexed = list(enumerate(samples))
     selected = indexed if args.limit < 0 else indexed[:args.limit]
     _require_dataset_images([sample for _, sample in selected])
-    run_root = Path(args.output_dir) / f"{time.strftime('%Y%m%d_%H%M%S')}-{_safe_name(args.run_label or 'run')}"
+    output_base = Path(args.output_dir).expanduser()
+    output_base = (output_base if output_base.is_absolute() else ROOT / output_base).resolve()
+    output_base.mkdir(parents=True, exist_ok=True)
+    run_root = Path(tempfile.mkdtemp(prefix=time.strftime("%Y%m%d_%H%M%S-"),
+                                    suffix=f"-{_safe_name(args.run_label or 'run')}",
+                                    dir=output_base))
     for sub in ["patches", ".work"]:
         (run_root / sub).mkdir(parents=True, exist_ok=True)
     args.run_root = str(run_root)
@@ -420,8 +428,8 @@ async def _main(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--input", default="../datasets/patcheval_verified.json")
-    p.add_argument("--output-dir", default="outputs")
+    p.add_argument("--input", default=str(ROOT / "patcheval/datasets/patcheval_verified.json"))
+    p.add_argument("--output-dir", default=str(ROOT / "patcheval/exp_agent/agent_runs"))
     p.add_argument("--limit", type=int, default=1)
     p.add_argument("--concurrency", type=int, default=4)
     p.add_argument("--run-label", default="")

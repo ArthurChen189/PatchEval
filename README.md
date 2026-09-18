@@ -253,6 +253,29 @@ A repair passes only when `fix-run.sh` exits successfully. See [patcheval/evalua
 
 `run_infer.sh` returns a non-zero exit code if any selected case fails, while preserving all generated patches and logs. Failed generation cases are represented by empty patch files and remain in the evaluation input, where they are counted as failed repairs.
 
+All workflow artifacts default to `patcheval/exp_agent/agent_runs/` (relative to
+the repository root): patches, raw trajectories, normalized analysis, converted
+evaluation input, reports, logs, harness configs, and resolved Hydra configs.
+Hydra creates an isolated invocation directory under `agent_runs/hydra/`; its
+`generation/`, `analysis/`, `eval_inputs/`, `evaluation_output/`, and `harnesses/`
+children hold the corresponding artifacts. Repeated labels do not overwrite
+previous default outputs. Direct generation uses a unique timestamp/random
+directory ending in the run label.
+
+Override `paths.runs` for a different artifact root, or use `hydra.run.dir`,
+`hydra.sweep.dir`, `analysis.output_dir`, or `configure.output_dir` for explicit
+destinations. Relative paths resolve from the repository root, even when the
+launcher is called elsewhere. The temporary helper uses `RUNS_DIR` for the
+same override. The legacy evaluation wrapper accepts `EVALUATION_OUTPUT_DIR`
+for an explicit invocation directory and uses Hydra for isolated output.
+Existing results are left in place; supply their path explicitly to evaluate
+or analyze them.
+
+Model caches and serving environments remain separate under `paths.runtime`
+(default `~/.cache/patcheval/local_llm`, overridden by `RUNTIME_DIR`); `HF_HOME`
+still controls the model cache. The temporary helper keeps its host-specific
+runtime default `/mnt/local/patcheval-local-llm`.
+
 ## 📁 Outputs
 
 A patch-generation run creates:
@@ -269,13 +292,13 @@ patcheval/exp_agent/agent_runs/<timestamp>-<prefix>/
 `run_eval.sh` converts these patches to:
 
 ```text
-patcheval/exp_agent/eval_inputs/<prefix>.jsonl
+patcheval/exp_agent/agent_runs/hydra/<invocation>-evaluate/eval_inputs/patches.jsonl
 ```
 
 Evaluation results are written to:
 
 ```text
-patcheval/evaluation/evaluation_output/results/<prefix>/
+patcheval/exp_agent/agent_runs/hydra/<invocation>-evaluate/evaluation_output/
 ├── run_evaluation.log
 ├── summary_report.txt
 ├── summary.json

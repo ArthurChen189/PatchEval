@@ -10,7 +10,7 @@ dry_run: false
 label: local_${harness.name}
 
 paths:
-  runtime: ${oc.env:RUNTIME_DIR,${repo:}/patcheval/exp_agent/agent_runs/local_llm} # Local LLM home (venv, caches, ~54 GB); RUNTIME_DIR or Hydra override.
+  runtime: ${oc.env:RUNTIME_DIR,${oc.env:HOME}/.cache/patcheval/local_llm} # Separate serving home (venv, caches, ~54 GB); RUNTIME_DIR or Hydra override.
   runs: ${repo:}/patcheval/exp_agent/agent_runs # Hydra jobs and generation runs; evaluation searches here when run_dir is null.
   dataset: ${repo:}/patcheval/datasets/patcheval_verified.json # 230 verified CVE cases for generation and evaluation.
   serving_env: ${paths.runtime}/venv-vllm # Isolated uv venv with pinned vLLM; created by action=setup.
@@ -33,7 +33,7 @@ server:
   extra_args: [] # Literal argv entries, never evaluated by a shell.
 
 configure:
-  output_dir: ${paths.runtime}/harnesses
+  output_dir: null # Default: this Hydra invocation / harnesses.
   force: false
 
 check:

@@ -10,7 +10,7 @@ PatchEval evaluates agent-generated vulnerability repairs in Docker environments
 - `scripts/`: Docker image downloader and `images.txt` manifest.
 - `tests/`: Python unit tests; `docs/` contains submission instructions and figures.
 
-Keep generation and evaluation separate. Generated artifacts belong under `agent_runs/`, `eval_inputs/`, and `evaluation_output/`, not alongside source files.
+Keep generation and evaluation separate. Generated artifacts default to `patcheval/exp_agent/agent_runs/`, including nested `eval_inputs/` and `evaluation_output/`, not alongside source files.
 
 ## Build, Test, and Development Commands
 
@@ -75,15 +75,19 @@ bash scripts/run.sh action=serve dry_run=true server.host=127.0.0.1
 ```
 
 All workflow-relative paths are resolved from the repository root, including
-when the CLI is launched from another directory. Hydra does not change the
-working directory. Each invocation records its config and overrides in
+when the CLI is launched from another directory. The entrypoint anchors execution at the repository root before Hydra initializes;
+Hydra itself does not change directories. Explicit relative `hydra.run.dir` and
+`hydra.sweep.dir` overrides therefore also resolve from the repository root. `paths.runs` defaults to `patcheval/exp_agent/agent_runs/`.
+Each invocation records its config and overrides in
 `paths.runs/hydra/<timestamp>-<action>/.hydra/` and its resolved settings in
 `resolved.yaml`. Generation writes its run beneath that invocation's
 `generation/` directory, keeping sweep jobs isolated. `--multirun` uses
 `paths.runs/hydra/multirun/`. Resolved snapshots may contain values obtained
 from environment interpolations, so keep credentials out of config files and
-CLI overrides. Runtime homes, model caches, and logs remain outside version
-control. `dry_run=true` saves configuration and prints the intended operation
+CLI overrides. Logs stay with their invocation. Serving environments and model
+caches remain separate: `paths.runtime` defaults to `~/.cache/patcheval/local_llm`
+(or `RUNTIME_DIR`), while `HF_HOME` overrides the model cache. All these
+artifacts remain outside version control. `dry_run=true` saves configuration and prints the intended operation
 without installing, serving, rendering harness homes, or running the benchmark.
 Endpoint auto-discovery still requires Docker unless an explicit address is set.
 
@@ -124,8 +128,8 @@ benchmark smoke test remain pending until a server is explicitly started.
 
 `serve` stays in the foreground and forwards signals by replacing the launcher
 with vLLM. It records the installed serving version in `server-version.json`
-next to the resolved configuration. Redirect console output to a runtime log
-when needed. `server.host=null` discovers the Docker bridge gateway; port
+next to the resolved configuration. Redirect console output beneath `paths.runs`
+when a separate console log is needed. `server.host=null` discovers the Docker bridge gateway; port
 30000 is the default. Container localhost is not the host. For a different
 endpoint set `server.host`, `server.port`, or `server.base_url` (client URL,
 including `/v1`). `check.protocol=both|chat|responses` and `check.timeout=300`
@@ -248,6 +252,25 @@ YAML or as CLI overrides. Evaluation never implicitly starts generation. Each ev
 stores conversion input in its own `eval_inputs/` directory and reports/logs in
 its own `evaluation_output/` directory; repeated labels do not overwrite prior
 reports. The conversion and evaluator Python entry points are unchanged.
+
+Standalone `action=configure` writes harness configs to its invocation's
+`harnesses/` directory by default. `configure.output_dir` and
+`analysis.output_dir` accept explicit destinations, resolved from the repository
+root when relative. Analysis defaults to its own invocation's `analysis/`.
+
+`temp_run_script.sh` uses the same default artifact root; `RUNS_DIR` overrides
+it, with relative values resolved from the repository root. Its `RUNTIME_DIR`
+continues to default to `/mnt/local/patcheval-local-llm` on this host. Existing
+results under `/mnt/local/patcheval-runs` are not moved or deleted; pass their
+absolute generation path to evaluate or analyze them.
+
+The legacy `run_eval.sh` now delegates to Hydra, retaining its positional prefix
+and optional run directory plus `MAX_WORKERS`, `LOG_LEVEL`, and `DATASET`.
+`RUNS_DIR` (or `OUTPUT_BASE`) selects its artifact root; `EVALUATION_OUTPUT_DIR`
+explicitly selects the evaluation invocation directory. Legacy `run_infer.sh`
+retains `OUTPUT_BASE`, with `RUNS_DIR` as a fallback. The direct Python runner
+also defaults to the shared artifact root and creates a unique directory on
+each call, including calls made within the same second.
 
 To render reusable configs separately:
 

@@ -52,7 +52,7 @@ bash run_eval.sh trae_smoke
 ```
 
 Generated patches are written to `agent_runs/<timestamp>-<prefix>/patches/`.
-Evaluation results are written to `../evaluation/evaluation_output/results/<prefix>/`.
+Evaluation results are written to `agent_runs/hydra/<invocation>-evaluate/evaluation_output/`.
 
 ## Layout
 
@@ -212,20 +212,20 @@ bash run_eval.sh codex_my_profile
 
 `run_eval.sh` will:
 
-1. find the latest `agent_runs/*-<prefix>` directory;
+1. find the latest completed matching run under `agent_runs/`, including Hydra runs;
 2. convert `patches/*.patch` to PatchEval evaluation JSONL with `process_data.py`;
 3. call `../evaluation/run_evaluation.py`.
 
 The converted patch file is written to:
 
 ```text
-eval_inputs/<prefix>.jsonl
+agent_runs/hydra/<invocation>-evaluate/eval_inputs/patches.jsonl
 ```
 
 Evaluation results are written by `run_evaluation.py` under:
 
 ```text
-../evaluation/evaluation_output/results/<prefix>/
+agent_runs/hydra/<invocation>-evaluate/evaluation_output/
 ```
 
 You can also pass the run directory explicitly:
@@ -233,6 +233,29 @@ You can also pass the run directory explicitly:
 ```bash
 bash run_eval.sh <prefix> /path/to/agent_runs/<timestamp>-<prefix>
 ```
+
+All workflow artifacts default to `patcheval/exp_agent/agent_runs/` (relative to
+the repository root): patches, raw trajectories, normalized analysis, converted
+evaluation input, reports, logs, harness configs, and resolved Hydra configs.
+Hydra creates an isolated invocation directory under `agent_runs/hydra/`; its
+`generation/`, `analysis/`, `eval_inputs/`, `evaluation_output/`, and `harnesses/`
+children hold the corresponding artifacts. Repeated labels do not overwrite
+previous default outputs. Direct generation uses a unique timestamp/random
+directory ending in the run label.
+
+Override `paths.runs` for a different artifact root, or use `hydra.run.dir`,
+`hydra.sweep.dir`, `analysis.output_dir`, or `configure.output_dir` for explicit
+destinations. Relative paths resolve from the repository root, even when the
+launcher is called elsewhere. The temporary helper uses `RUNS_DIR` for the
+same override. The legacy evaluation wrapper accepts `EVALUATION_OUTPUT_DIR`
+for an explicit invocation directory and uses Hydra for isolated output.
+Existing results are left in place; supply their path explicitly to evaluate
+or analyze them.
+
+Model caches and serving environments remain separate under `paths.runtime`
+(default `~/.cache/patcheval/local_llm`, overridden by `RUNTIME_DIR`); `HF_HOME`
+still controls the model cache. The temporary helper keeps its host-specific
+runtime default `/mnt/local/patcheval-local-llm`.
 
 ## Runner behavior
 

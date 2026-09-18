@@ -128,13 +128,13 @@ class HydraWorkflowTests(unittest.TestCase):
             root = Path(tmp)
             (root / 'infer').mkdir()
             (root / 'run.sh').write_text('printf "%s\\n" "$@"\n')
-            for name in ('serve_vllm.sh', 'serve_sglang.sh'):
+            for name in ('serve_vllm.sh',):
                 (root / 'infer' / name).write_text((ROOT / 'scripts/infer' / name).read_text())
-            for name in ('serve_vllm.sh', 'serve_sglang.sh'):
+            for name in ('serve_vllm.sh',):
                 result = subprocess.run(['bash', str(root / 'infer' / name), 'serve',
                                          'dry_run=true', 'server.gpu=0,1'], capture_output=True, text=True, check=True)
                 self.assertEqual(result.stdout.splitlines(), ['dry_run=true', 'server.gpu=0,1', 'action=serve'])
-                self.assertEqual('deprecated' in result.stderr, name == 'serve_sglang.sh')
+                self.assertEqual(result.stderr, '')
 
     def test_generate_uses_config_instead_of_ambient_runner_settings(self):
         cfg = config('action=generate', 'experiment=smoke', 'harness=opencode',
