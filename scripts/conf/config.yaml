@@ -10,13 +10,13 @@ dry_run: false
 label: local_${harness.name}
 
 paths:
-  runtime: ${oc.env:RUNTIME_DIR,${repo:}/patcheval/exp_agent/agent_runs/local_llm}
-  runs: ${repo:}/patcheval/exp_agent/agent_runs
-  dataset: ${repo:}/patcheval/datasets/patcheval_verified.json
-  serving_env: ${paths.runtime}/venv
-  hf_cache: ${oc.env:HF_HOME,${paths.runtime}/huggingface}
-  uv_cache: ${paths.runtime}/uv-cache
-  python_install: ${paths.runtime}/python
+  runtime: ${oc.env:RUNTIME_DIR,${repo:}/patcheval/exp_agent/agent_runs/local_llm} # Local LLM home (venv, caches, ~54 GB); RUNTIME_DIR or Hydra override.
+  runs: ${repo:}/patcheval/exp_agent/agent_runs # Hydra jobs and generation runs; evaluation searches here when run_dir is null.
+  dataset: ${repo:}/patcheval/datasets/patcheval_verified.json # 230 verified CVE cases for generation and evaluation.
+  serving_env: ${paths.runtime}/venv # Isolated uv venv with pinned SGLang; created by action=setup.
+  hf_cache: ${oc.env:HF_HOME,${paths.runtime}/huggingface} # Hugging Face model cache; HF_HOME or Hydra override.
+  uv_cache: ${paths.runtime}/uv-cache # uv download cache used during setup (UV_CACHE_DIR).
+  python_install: ${paths.runtime}/python # Managed CPython 3.12 plus headers required by Triton.
 
 server:
   version: 0.5.19

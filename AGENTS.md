@@ -278,24 +278,58 @@ prompts and tools.
 ## Docker storage on the ephemeral disk
 
 On this host, `../ephemeral` links to the mounted filesystem at `/mnt/local`.
-Docker uses `/mnt/local/docker` (also accessible as `../ephemeral/docker`) as
-its data root. Image names and the Docker socket remain unchanged, so the
-downloader, agent runner, and evaluator use this storage automatically.
+Image names and the Docker socket remain unchanged, so the downloader, agent
+runner, and evaluator talk to the same daemon; they do not choose where layers
+are stored.
 
-The host configuration is `{"data-root": "/mnt/local/docker"}` in
-`/etc/docker/daemon.json`. A Docker systemd override requires the mount and
-checks that `/mnt/local` is a mount point before starting Docker. The existing
-`/etc/fstab` entry mounts the disk at boot. These are host settings, not
-settings applied automatically by cloning this repository.
+`{"data-root": "/mnt/local/docker"}` in `/etc/docker/daemon.json` is **not**
+enough by itself. This engine uses the containerd snapshotter (`Storage Driver:
+overlayfs`, `driver-type: io.containerd.snapshotter.v1`). Docker's data-root
+then holds only daemon metadata (networks, volumes, image *names*). Image
+blobs and overlay snapshots stay in containerd's own root, which defaults to
+`/var/lib/containerd` while `root` is commented out in
+`/etc/containerd/config.toml`.
 
-Verify storage before a bulk download:
+That split filled the boot disk during a bulk pull: `/` hit 100% (226 GB) with
+0 bytes free, `/mnt/local` stayed ~1% used, `/mnt/local/docker` was hundreds of
+KB, and `/var/lib/containerd` held ~201 GB
+(`io.containerd.content.v1.content` plus
+`io.containerd.snapshotter.v1.overlayfs`). Further pulls then failed with
+"no space left on device" even though the ephemeral disk had terabytes free.
+
+Point **both** stores at the mounted disk before downloading:
+
+```json
+{"data-root": "/mnt/local/docker"}
+```
+
+```toml
+root = "/mnt/local/containerd"
+```
+
+If images were already pulled into `/var/lib/containerd`, stop Docker and
+containerd, rsync that tree to the new root, start the services, confirm
+`docker images` still lists them, then remove the old directory. Creating
+`/mnt/local/docker` or changing only `data-root` does not relocate containerd.
+A Docker systemd override may also require the mount and check that
+`/mnt/local` is a mount point before starting Docker. The existing `/etc/fstab`
+entry mounts the disk at boot. These are host settings, not settings applied
+automatically by cloning this repository.
+
+Verify **both** filesystems and **both** roots before a bulk download:
 
 ```bash
 readlink -f ../ephemeral
 findmnt --target /mnt/local
-docker info --format '{{.DockerRootDir}}'
-df -h /mnt/local
+docker info --format '{{.DockerRootDir}} {{.Driver}}'
+df -h / /mnt/local
+sudo du -sh /mnt/local/docker /var/lib/containerd /mnt/local/containerd
 ```
+
+`DockerRootDir=/mnt/local/docker` is not sufficient. Confirm containerd's
+content and overlay directories are on `/mnt/local`, not `/`, and that `/`
+still has headroom. The downloader's "storage:" line reports Docker's
+data-root only.
 
 To keep download logs on that disk, run from the repository root:
 
@@ -312,9 +346,12 @@ raise SystemExit(0 if success > 0 and failed == 0 else 1)
 PYTHON
 ```
 
-The downloader logs the connected daemon's storage directory and honors the
-Docker SDK environment settings consistently. On other hosts, configure the
-daemon's data root for the desired mounted filesystem before downloading.
+`scripts/download_images.py` uses relative `images.txt` and `pull_images.log`,
+so run it from `scripts/` (or pass those paths). It does not select the image
+destination. On other hosts, configure Docker's data-root **and** containerd's
+`root` for the desired mounted filesystem before downloading. The daemon also
+needs socket access (`docker` group or equivalent); a missing SDK in system
+Python is unrelated to disk layout.
 
 The existing runner defaults to `AGENT_TIMEOUT=3600` seconds. A timed-out agent
 produces an empty submitted patch, even if it changed its working tree before
