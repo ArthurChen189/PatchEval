@@ -37,8 +37,8 @@ def positive(value, name):
 
 
 def validate(cfg):
-    if cfg.action not in {"setup", "serve", "configure", "check", "generate", "evaluate"}:
-        raise ValueError("action must be setup, serve, configure, check, generate, or evaluate")
+    if cfg.action not in {"setup", "serve", "configure", "check", "generate", "evaluate", "analyze"}:
+        raise ValueError("action must be setup, serve, configure, check, generate, evaluate, or analyze")
     if not isinstance(cfg.generation.save_trajectories, bool):
         raise ValueError("generation.save_trajectories must be a boolean")
     if cfg.harness.name not in {"codex", "opencode", "traecli"}:
@@ -242,6 +242,17 @@ def dispatch(cfg, output):
             return
         if run_checks(url, cfg.model.served_name, cfg.check.protocol, cfg.check.timeout):
             raise SystemExit(1)
+    elif cfg.action == "analyze":
+        from scripts.infer.analyze_trajectories import analyze
+        if not cfg.analysis.input_dir:
+            raise ValueError("Set analysis.input_dir to a generation run or trajectory directory")
+        save_config(cfg, output)
+        destination = absolute(cfg.analysis.output_dir) if cfg.analysis.output_dir else output / "analysis"
+        if cfg.dry_run:
+            print(f"Would normalize trajectories from {absolute(cfg.analysis.input_dir)} into {destination}")
+            return
+        summary = analyze(absolute(cfg.analysis.input_dir), destination)
+        print(f"Normalized {summary['completed_tasks']} tasks: {destination}")
     elif cfg.action == "evaluate":
         run, jobs = evaluation_jobs(cfg, output)
         cfg.evaluation.run_dir = str(run)

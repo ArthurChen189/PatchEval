@@ -163,6 +163,47 @@ bash scripts/run.sh action=generate experiment=smoke harness=codex \
   generation.save_trajectories=true
 ```
 
+### Normalized trajectory analysis
+
+Run a separate, read-only analysis of completed Codex archives:
+
+```bash
+bash scripts/run.sh action=analyze analysis.input_dir=/absolute/path/to/generation-run
+```
+
+The input may also be a benchmark folder or one archived task. Results default
+to the analysis invocation's `analysis/` directory. Set `analysis.output_dir`
+to a new directory to choose another destination; existing output directories
+and raw trajectory directories are protected. Running tasks are skipped; rerun
+this action for a fresh snapshot after more tasks finish. This action does not
+contact Docker or change generation, evaluation, or raw logs.
+
+Each task JSON groups native events by session and item ID, and tools by
+`call_id`. It retains exact item variants and source file/line references.
+Reasoning uses content (or raw content) preferentially, with summary as a
+fallback; these aliases are never concatenated. User-message UI events with
+separate IDs are correlated only against a unique exact message within the
+same session and turn, with the alias basis recorded. Other distinct IDs are
+not merged just because their text matches. CLI JSON is referenced rather than
+added to native counts because its IDs need not match native IDs.
+
+Token totals sum `token_usage_record.usage` once per session/response ID.
+`turn_token_usage`, `thread_token_usage`, and `token_count` mirrors are excluded.
+Reasoning tokens are reported as a subset of output tokens, never added again.
+Conflicting usage records and missing IDs produce warnings; cumulative-only
+archives are not assigned fabricated per-response usage.
+
+Tool records preserve `CommandExecution.stdout`, `stderr`, `aggregated_output`,
+and exact `function_call_output` variants separately. Comparisons identify
+wrapper-only differences, containment, other differences, and truncation
+markers. Do not assume command stdout is the complete model-visible response:
+in the first 14 Qwen task archives, 677 comparisons differed only by wrappers
+and 67 had content differences, including 14 with truncation markers. Some
+function outputs contain text absent from both stdout and aggregated output,
+even with empty stderr. These observations do not establish the harness's
+internal cause, and text already omitted by the harness cannot be recovered.
+Source hashes in each normalized JSON support checking archive integrity.
+
 ### Harness configuration, generation, and evaluation
 
 Generation automatically renders fresh Codex/OpenCode configs in its Hydra

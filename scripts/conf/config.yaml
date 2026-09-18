@@ -4,7 +4,7 @@ defaults:
   - _self_
   - optional experiment: null
 
-# setup | serve | configure | check | generate | evaluate
+# setup | serve | configure | check | generate | evaluate | analyze
 action: check
 dry_run: false
 label: local_${harness.name}
@@ -44,6 +44,10 @@ generation:
   concurrency: 1
   timeout: 3600
   save_trajectories: true # Preserve per-task prompts, events, stderr, and native sessions.
+
+analysis:
+  input_dir: null # Generation run, benchmark folder, or one archived task.
+  output_dir: null # Default: this Hydra invocation / analysis; must be a new directory.
 
 evaluation:
   run_dir: null # null selects the newest completed run matching label under paths.runs.

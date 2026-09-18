@@ -22,6 +22,18 @@ def config(*overrides):
 
 
 class HydraWorkflowTests(unittest.TestCase):
+    def test_analysis_dispatch_is_separate_and_does_not_contact_docker(self):
+        cfg = config('action=analyze', 'analysis.input_dir=agent_runs/example')
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch('scripts.infer.analyze_trajectories.analyze', return_value={'completed_tasks': 1}) as normalize:
+                with patch.object(workflow, 'bridge_host', side_effect=AssertionError('unexpected Docker call')):
+                    workflow.dispatch(cfg, Path(tmp))
+            normalize.assert_called_once_with(ROOT / 'agent_runs/example', Path(tmp) / 'analysis')
+            cfg.dry_run = True
+            with patch('scripts.infer.analyze_trajectories.analyze') as normalize:
+                workflow.dispatch(cfg, Path(tmp))
+                normalize.assert_not_called()
+
     def test_groups_and_model_overrides_drive_both_harnesses(self):
         cfg = config('experiment=smoke', 'harness=opencode', 'model.path=local-model',
                      'model.context_length=32768', 'model.output_tokens=4096', 'server.host=127.0.0.1')
