@@ -138,8 +138,15 @@ def generation_job(cfg, output):
     binary = str(cfg.harness.binary)
     if "/" in binary:
         binary = str(absolute(binary))
-    elif not cfg.dry_run:
-        binary = shutil.which(binary) or ""
+    else:
+        resolved = shutil.which(binary)
+        # The OpenCode installer updates .bashrc, which zsh and noninteractive
+        # shells need not read. Fall back only for its default executable name.
+        if not resolved and cfg.harness.name == "opencode" and binary == "opencode":
+            installed = Path.home() / ".opencode/bin/opencode"
+            if installed.is_file() and os.access(installed, os.X_OK):
+                resolved = str(installed)
+        binary = resolved or (binary if cfg.dry_run else "")
     if not cfg.dry_run and (not binary or not os.access(binary, os.X_OK)):
         raise ValueError(f"Harness executable not found; set harness.binary (currently {cfg.harness.binary!r})")
     if cfg.harness.config:

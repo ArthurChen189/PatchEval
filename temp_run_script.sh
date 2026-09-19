@@ -14,6 +14,8 @@ set -euo pipefail
 #   bash temp_run_script.sh smoke
 # Inspect smoke summaries/logs, then run generation followed by evaluation:
 #   bash temp_run_script.sh full
+# OpenCode is found on PATH or at ~/.opencode/bin/opencode (no .bashrc needed).
+# OPENCODE_BIN=/absolute/path/to/opencode overrides executable discovery.
 # Choose a harness or override concurrency explicitly:
 #   HARNESS=opencode CONCURRENCY=8 MAX_WORKERS=16 bash temp_run_script.sh full
 # Artifacts default to patcheval/exp_agent/agent_runs/; RUNS_DIR overrides it.

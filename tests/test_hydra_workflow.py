@@ -136,6 +136,41 @@ class HydraWorkflowTests(unittest.TestCase):
                 self.assertEqual(result.stdout.splitlines(), ['dry_run=true', 'server.gpu=0,1', 'action=serve'])
                 self.assertEqual(result.stderr, '')
 
+    def test_opencode_standard_install_fallback_and_overrides(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            installed = home / '.opencode/bin/opencode'
+            installed.parent.mkdir(parents=True)
+            installed.touch()
+            installed.chmod(0o755)
+            cfg = config('harness=opencode', 'server.host=127.0.0.1')
+            with patch.object(workflow.Path, 'home', return_value=home), \
+                 patch.object(workflow.shutil, 'which', return_value=None):
+                _, env = workflow.generation_job(cfg, home / 'job')
+                self.assertEqual(env['OPENCODE_BIN'], str(installed))
+                cfg.dry_run = True
+                _, env = workflow.generation_job(cfg, home / 'preview')
+                self.assertEqual(env['OPENCODE_BIN'], str(installed))
+                cfg.dry_run = False
+                cfg.harness.binary = str(home / 'explicit-missing')
+                with self.assertRaisesRegex(ValueError, 'Harness executable not found'):
+                    workflow.generation_job(cfg, home / 'missing')
+                cfg.harness.binary = 'custom-opencode'
+                with self.assertRaisesRegex(ValueError, 'Harness executable not found'):
+                    workflow.generation_job(cfg, home / 'custom')
+                cfg.harness.binary = 'opencode'
+                installed.chmod(0o644)
+                with self.assertRaisesRegex(ValueError, 'Harness executable not found'):
+                    workflow.generation_job(cfg, home / 'not-executable')
+            cfg.dry_run = True
+            with patch.object(workflow.shutil, 'which', return_value='/preferred/opencode'):
+                _, env = workflow.generation_job(cfg, home / 'path-preview')
+                self.assertEqual(env['OPENCODE_BIN'], '/preferred/opencode')
+            with patch.dict(os.environ, {'OPENCODE_BIN': '/custom/opencode'}):
+                cfg = config('harness=opencode', 'dry_run=true', 'server.host=127.0.0.1')
+                _, env = workflow.generation_job(cfg, home / 'env-preview')
+                self.assertEqual(env['OPENCODE_BIN'], '/custom/opencode')
+
     def test_generate_uses_config_instead_of_ambient_runner_settings(self):
         cfg = config('action=generate', 'experiment=smoke', 'harness=opencode',
                      'generation.timeout=42', 'server.host=127.0.0.1')

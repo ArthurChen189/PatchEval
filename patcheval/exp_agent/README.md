@@ -295,3 +295,15 @@ agent_runs/<timestamp>-<prefix>/
   preserving all generated patches and logs. Failed cases are represented by
   empty patch files and are counted as failed repairs during evaluation.
 - Keep credentials and runtime homes outside version control.
+
+OpenCode executable discovery checks `PATH` first, then `~/.opencode/bin/opencode`
+when the configured executable is the default `opencode`. This supports zsh and
+noninteractive Bash without sourcing `.bashrc`. An explicit `OPENCODE_BIN` or
+`harness.binary` path takes precedence; invalid explicit paths fail rather than
+silently selecting a different installation. For the temporary helper:
+
+```bash
+HARNESS=opencode bash temp_run_script.sh smoke
+# Optional explicit executable override:
+OPENCODE_BIN="$HOME/.opencode/bin/opencode" HARNESS=opencode bash temp_run_script.sh smoke
+```

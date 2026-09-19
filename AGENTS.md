@@ -396,3 +396,15 @@ The existing runner defaults to `AGENT_TIMEOUT=3600` seconds. A timed-out agent
 produces an empty submitted patch, even if it changed its working tree before
 timeout, because patch collection requires a successful agent exit. Choose a
 time budget suitable for local generation speed when measuring repair success.
+
+OpenCode executable discovery checks `PATH` first, then `~/.opencode/bin/opencode`
+when the configured executable is the default `opencode`. This supports zsh and
+noninteractive Bash without sourcing `.bashrc`. An explicit `OPENCODE_BIN` or
+`harness.binary` path takes precedence; invalid explicit paths fail rather than
+silently selecting a different installation. For the temporary helper:
+
+```bash
+HARNESS=opencode bash temp_run_script.sh smoke
+# Optional explicit executable override:
+OPENCODE_BIN="$HOME/.opencode/bin/opencode" HARNESS=opencode bash temp_run_script.sh smoke
+```
