@@ -1,4 +1,8 @@
 name: codex
-binary: ${oc.env:CODEX_BIN,codex}
+# Pinned Codex CLI, vendored under third_party/codex/<version>/ and extracted from
+# its .xz archive (checksum-verified) on first use.
+binary: ${repo:}/third_party/codex/0.155.0/codex-x86_64-unknown-linux-musl
+# Generation refuses a binary that reports another version; null disables the check.
+version: 0.155.0
 # null renders a fresh local-model config for each generation invocation.
 config: null

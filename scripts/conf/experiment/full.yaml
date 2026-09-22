@@ -2,6 +2,8 @@
 label: local_${harness.name}_full
 generation:
   limit: -1
-  concurrency: 1
+  # 6 sessions per GPU for 8 replicas x 8 slots: agents spend part of each turn in
+  # tools, and worst-case resident context stays within the KV budget.
+  concurrency: 48
 evaluation:
-  max_workers: 1
+  max_workers: 16

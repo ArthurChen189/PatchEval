@@ -59,3 +59,8 @@ cvelistV5/
 *shared/
 *simulation_environments/
 *volumes/
+
+# Vendored harness binaries: keep the .xz archive, not the extracted executable
+third_party/codex/*/codex-x86_64-unknown-linux-musl
+third_party/opencode/*/opencode-linux-x64
+third_party/*/*/*.partial

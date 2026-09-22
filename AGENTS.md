@@ -59,8 +59,9 @@ runner, dataset, and evaluator retain their existing interfaces.
 The shared configuration is `scripts/conf/config.yaml`. Config groups live in
 `model/`, `harness/`, and `experiment/` beneath that directory. The supplied
 model is `qwen3_8_27b`, harnesses are `codex`, `opencode`, and `traecli`, and
-experiment presets are `smoke` (one case) and `full` (all cases). Both presets
-start with one concurrent generation container and one evaluation worker.
+experiment presets are `smoke` (the first five cases, 8 generation containers
+and 8 evaluation workers) and `full` (all cases, 48 generation containers and 16
+evaluation workers).
 Add another YAML file to the appropriate group to save reusable settings.
 Experiment files use `# @package _global_` to override shared settings; they
 may select groups using `defaults: [{override /harness: opencode}]`.
@@ -96,9 +97,39 @@ Endpoint auto-discovery still requires Docker unless an explicit address is set.
 The default `model=qwen3_8_27b` serves `Qwen/Qwen3.8-27B` in BF16 with
 `--tensor-parallel-size 1` and `--data-parallel-size 8` on eight H200s (the 27B checkpoint fits on one
 GPU, so data parallel replicas raise throughput instead of tensor-sharding the
-weights), a 262,144-token context, `server.memory_fraction=0.85`, and one active request
-per replica (`--max-num-seqs 1`). vLLM balances requests across replicas behind
-one endpoint. Automatic tool choice is enabled.
+weights), a 262,144-token context, `server.memory_fraction=0.85`, and up to 8
+running requests per replica (`server.max_running_requests=8`, `--max-num-seqs 8`).
+vLLM balances requests across replicas (least-loaded, without per-conversation
+affinity) behind one endpoint. Automatic tool choice is enabled.
+
+Serving enables only lossless accelerations, all BF16 (no FP8 weights or KV):
+MTP speculative decoding with the checkpoint's own draft layer
+(`server.speculative={method: mtp, num_speculative_tokens: 3}`, from the vLLM
+Qwen3.8 recipe; rejection sampling keeps the output distribution), batching,
+prefix caching (`server.prefix_caching`; Mamba "align" mode for the hybrid
+layers), chunked prefill (`server.chunked_prefill`), and vLLM's default CUDA
+graphs (FULL_AND_PIECEWISE). vLLM 0.29.0 builds this configuration offline:
+draft `Qwen3_5MTP`, `max_num_seqs=8`, and 2,048 batched tokens per step.
+Sizing: only 16 of 64 layers use full attention (4 KV heads x 256 dims), so the
+BF16 KV cache costs 64 KiB/token, about 900k tokens per H200 after 54 GB of
+weights. The first 16k-cap OpenCode run peaked at ~72k context per session
+(median) and ~135k (p90), so 8 slots per replica fit typical load and vLLM
+preempts rather than fails at the extremes; `full` runs 48 containers (about 6
+sessions per GPU, since agents spend part of each turn in tools). These values
+are computed, not yet measured: confirm with the server's startup KV capacity,
+MTP acceptance in its metrics log, and a short concurrency sweep before long
+runs. Batching slows each request, so the fixed agent timeout binds sooner than
+at one request per replica; compare timeout counts when changing concurrency.
+Set these through the named fields; the corresponding flags in
+`server.extra_args` are rejected. Generation warns when `generation.concurrency`
+exceeds `data_parallel x max_running_requests`.
+
+`serve` also writes `${paths.runtime}/current-server.json` (argv, vLLM version,
+start time). Each generation copies it to `server.json` in its invocation, and
+`generation.resume_dir` refuses to resume if the current record differs from
+the invocation's, so all samples of a run share one engine configuration.
+Restart the server to apply new serving settings, never during a generation
+run; runs made before this record existed only produce a warning.
 Thinking and sampling use the checkpoint defaults: `model.temperature=null`
 sends no temperature from the server or any harness, so vLLM applies the
 model's `generation_config.json` (its startup log reports the defaults).
@@ -328,12 +359,28 @@ Existing generated files are protected unless `configure.force=true`. The
 Codex home contains `config.toml` and `local.config.toml`; Codex 0.154.0 and
 later load named profiles from the latter, so do not add legacy `[profiles.local]` tables.
 OpenCode receives its expected XDG config/data layout. The integration was
-checked with Codex 0.154.0, 0.155.0, and 0.155.1 and OpenCode 1.18.31. The
-standalone Codex install updates itself, so a bare `codex` can change between
-runs; set `harness.binary` to a release path under
-`~/.codex/packages/standalone/releases/` to pin it. Each generation records the
-CLI version in `harness-version.json` beside `resolved.yaml`, and warns when a
-rendered OpenCode config is used with a release other than 1.18.31. To sweep generation settings, use Hydra `--multirun`, e.g.
+checked with Codex 0.154.0, 0.155.0, and 0.155.1 and OpenCode 1.18.31. Both
+harnesses are pinned so every run uses the same agent: the official release
+binaries are vendored under `third_party/` with their licenses, `SHA256SUMS`, and
+a provenance README, as xz archives stored with Git LFS
+(`third_party/**/*.xz`; install `git-lfs` and run `git lfs install` before
+cloning or pushing):
+
+- Codex 0.155.0: `third_party/codex/0.155.0/codex-x86_64-unknown-linux-musl.xz`
+  (static musl build, Apache-2.0), identical to the `rust-v0.155.0` asset.
+- OpenCode 1.18.31: `third_party/opencode/1.18.31/opencode-linux-x64.xz`
+  (glibc build, MIT), identical to the `v1.18.31` `opencode-linux-x64.tar.gz`.
+
+`scripts/conf/harness/{codex,opencode}.yaml` default `harness.binary` to the
+extracted executable beside each archive and set `harness.version`. Generation
+extracts a missing executable on first use, verifies both checksums, and keeps
+it git-ignored; it then refuses any binary whose `--version` differs from
+`harness.version` (the hosts' standalone installs update themselves, e.g. Codex
+to 0.156.0). `CODEX_BIN`/`OPENCODE_BIN` or `harness.binary` still select another
+executable, which also requires overriding `harness.version` (or `null` to skip
+the check). Each generation records the CLI version in `harness-version.json`
+beside `resolved.yaml`; with `harness.version=null`, a rendered OpenCode config
+used with a release other than 1.18.31 only warns. To sweep generation settings, use Hydra `--multirun`, e.g.
 `bash scripts/run.sh --multirun action=generate experiment=smoke harness=codex,opencode`.
 The default Hydra launcher runs sweep jobs sequentially; avoid serving sweeps
 on a shared GPU/port.
@@ -358,8 +405,8 @@ explicit Hydra overrides take precedence. The lower-level
 environment-based interfaces.
 
 Use `experiment=full` and a distinct label after reviewing smoke outputs.
-Increase `generation.concurrency` with `server.data_parallel` and
-`server.max_running_requests` only after measuring GPU memory. The existing
+Change `generation.concurrency` together with `server.data_parallel` and
+`server.max_running_requests`, and only after checking KV capacity and timeouts. The existing
 end-to-end verified dataset is unchanged; no new partition is introduced. An
 unsuccessful repair is not an infrastructure failure. Keep reference patches
 and fix metadata out of repair prompts and tools.
@@ -448,8 +495,9 @@ produces an empty submitted patch, even if it changed its working tree before
 timeout, because patch collection requires a successful agent exit. Choose a
 time budget suitable for local generation speed when measuring repair success.
 
-OpenCode executable discovery checks `PATH` first, then `~/.opencode/bin/opencode`
-when the configured executable is the default `opencode`. This supports zsh and
+The pinned vendored OpenCode is the default. With `harness.binary=opencode`
+(an unpinned bare name, which also needs `harness.version`), executable discovery
+checks `PATH` first, then `~/.opencode/bin/opencode`. This supports zsh and
 noninteractive Bash without sourcing `.bashrc`. An explicit `OPENCODE_BIN` or
 `harness.binary` path takes precedence; invalid explicit paths fail rather than
 silently selecting a different installation. For the temporary helper:

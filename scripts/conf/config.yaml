@@ -29,7 +29,17 @@ server:
   data_parallel: 8 # One full replica per GPU (--data-parallel-size); better throughput than TP.
   dtype: bfloat16
   memory_fraction: 0.85
-  max_running_requests: 1 # Per replica; raise with generation.concurrency after smoke.
+  # Per replica (--max-num-seqs). BF16 KV costs 64 KiB/token (16 full-attention
+  # layers x 4 KV heads x 256 dims), leaving ~900k tokens per H200 after weights;
+  # 8 sessions at the measured ~72k median peak context fit with headroom.
+  max_running_requests: 8
+  # Lossless speedups. MTP drafts with the checkpoint's own MTP layer and
+  # rejection sampling keeps the output distribution unchanged; null disables.
+  speculative:
+    method: mtp
+    num_speculative_tokens: 3
+  prefix_caching: true # Reuse KV (and Mamba "align" states) across agent turns.
+  chunked_prefill: true # Interleave long prompt prefill with decoding.
   extra_args: [] # Literal argv entries, never evaluated by a shell.
 
 configure:

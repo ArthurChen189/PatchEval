@@ -189,7 +189,13 @@ class GenerationSampleTests(unittest.TestCase):
             def record(command, env, cfg, cwd=None):
                 calls.append(env)
                 fake(command, env, cfg, cwd)
-            cfg = config('action=generate', 'server.host=127.0.0.1', f'generation.resume_dir={target}')
+            runtime = Path(tmp) / 'runtime'
+            runtime.mkdir()
+            server = {'argv': ['serve', 'Qwen/Qwen3.8-27B', '--max-num-seqs', '8'], 'vllm': '0.29.0'}
+            (runtime / 'current-server.json').write_text(json.dumps(server))
+            (target / 'server.json').write_text(json.dumps(server))
+            cfg = config('action=generate', 'server.host=127.0.0.1', f'generation.resume_dir={target}',
+                         f'paths.runtime={runtime}')
             cfg.harness.binary = '/bin/true'
             with patch.object(workflow, 'run_command', side_effect=record), \
                  patch.object(workflow, 'record_harness_version', return_value={'version': '1.18.31'}), \
@@ -204,6 +210,7 @@ class GenerationSampleTests(unittest.TestCase):
             self.assertEqual((log['samples'], log['incomplete']), ([1, 2, 3], []))
             evaluate = config('action=evaluate', f'evaluation.run_dir={done}')
             self.assertEqual(len(workflow.find_runs(evaluate)), 4)
+            self.assertEqual(json.loads((Path(tmp) / 'resume/server.json').read_text()), server)
 
             (target / 'generation/sample_3').rename(target / 'generation/sample_3.bak')
             with patch.object(workflow, 'run_command') as never, \
@@ -211,6 +218,14 @@ class GenerationSampleTests(unittest.TestCase):
                  patch('builtins.print'):
                 with self.assertRaisesRegex(ValueError, 'Harness version changed'):
                     workflow.dispatch(cfg, Path(tmp) / 'resume2')
+                never.assert_not_called()
+            changed = {**server, 'argv': server['argv'][:-1] + ['1']}
+            (runtime / 'current-server.json').write_text(json.dumps(changed))
+            with patch.object(workflow, 'run_command') as never, \
+                 patch.object(workflow, 'record_harness_version', return_value={'version': '1.18.31'}), \
+                 patch('builtins.print'):
+                with self.assertRaisesRegex(ValueError, 'serving configuration differs'):
+                    workflow.dispatch(cfg, Path(tmp) / 'resume3')
                 never.assert_not_called()
 
 

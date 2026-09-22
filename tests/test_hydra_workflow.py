@@ -37,7 +37,7 @@ class HydraWorkflowTests(unittest.TestCase):
     def test_groups_and_model_overrides_drive_both_harnesses(self):
         cfg = config('experiment=smoke', 'harness=opencode', 'model.path=local-model',
                      'model.context_length=32768', 'model.output_tokens=4096', 'server.host=127.0.0.1')
-        self.assertEqual(cfg.generation.limit, 1)
+        self.assertEqual(cfg.generation.limit, 5)
         self.assertEqual(cfg.label, 'local_opencode_smoke')
         self.assertEqual(cfg.model.served_name, 'local-model')
         with tempfile.TemporaryDirectory() as tmp:
@@ -70,7 +70,7 @@ class HydraWorkflowTests(unittest.TestCase):
         self.assertEqual(command[:3], [str(workflow.absolute(cfg.paths.serving_env) / 'bin/vllm'),
                                      'serve', 'Qwen/Qwen3.8-27B'])
         for flag, value in {'--max-model-len': '262144', '--gpu-memory-utilization': '0.85',
-                            '--max-num-seqs': '1', '--reasoning-parser': 'qwen3',
+                            '--max-num-seqs': '8', '--reasoning-parser': 'qwen3',
                             '--tool-call-parser': 'qwen3_xml'}.items():
             self.assertEqual(command[command.index(flag) + 1], value)
         self.assertIn('--enable-auto-tool-choice', command)
@@ -83,6 +83,28 @@ class HydraWorkflowTests(unittest.TestCase):
         self.assertEqual(command[command.index('--tensor-parallel-size') + 1], '2')
         self.assertEqual(command[command.index('--data-parallel-size') + 1], '4')
         self.assertNotIn('--enable-auto-tool-choice', command)
+
+    def test_lossless_acceleration_flags(self):
+        cfg = config('server.host=127.0.0.1')
+        command = workflow.serve_command(cfg)
+        self.assertEqual(json.loads(command[command.index('--speculative-config') + 1]),
+                         {'method': 'mtp', 'num_speculative_tokens': 3})
+        self.assertIn('--enable-prefix-caching', command)
+        self.assertIn('--enable-chunked-prefill', command)
+        self.assertEqual(config('experiment=full').generation.concurrency, 48)
+        cfg = config('server.host=127.0.0.1', 'server.speculative=null',
+                     'server.prefix_caching=false', 'server.chunked_prefill=false')
+        command = workflow.serve_command(cfg)
+        self.assertNotIn('--speculative-config', command)
+        self.assertIn('--no-enable-prefix-caching', command)
+        self.assertIn('--no-enable-chunked-prefill', command)
+        for overrides in (["server.extra_args=['--speculative-config={}']"], ["server.extra_args=[--max-num-seqs,'4']"],
+                          ['server.prefix_caching=maybe'], ['server.speculative.num_speculative_tokens=0']):
+            with self.subTest(overrides=overrides), self.assertRaises(ValueError):
+                workflow.validate(config('server.host=127.0.0.1', *overrides))
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            workflow.validate(config('action=generate', 'generation.concurrency=65'))
+        self.assertIn('exceeds', err.getvalue())
 
     def test_uniform_generation_defaults(self):
         cfg = config('server.host=127.0.0.1')
@@ -129,6 +151,9 @@ class HydraWorkflowTests(unittest.TestCase):
             self.assertIn('import vllm', execute.call_args.args[0][-1])
             self.assertEqual(json.loads((Path(tmp) / 'record/server-version.json').read_text()),
                              {'vllm': '0.29.0'})
+            current = json.loads((Path(tmp) / 'current-server.json').read_text())
+            self.assertEqual((current['vllm'], current['argv'][0]), ('0.29.0', 'serve'))
+            self.assertIn('--speculative-config', current['argv'])
             self.assertEqual(launch.call_args.args[0], str(binary_dir / 'vllm'))
             self.assertEqual(launch.call_args.args[2]['CUDA_VISIBLE_DEVICES'], '0,1,2,3,4,5,6,7')
 
@@ -159,7 +184,8 @@ class HydraWorkflowTests(unittest.TestCase):
             installed.parent.mkdir(parents=True)
             installed.touch()
             installed.chmod(0o755)
-            cfg = config('harness=opencode', 'server.host=127.0.0.1')
+            # The ~/.opencode fallback applies to an explicitly unpinned bare name.
+            cfg = config('harness=opencode', 'server.host=127.0.0.1', 'harness.binary=opencode')
             with patch.object(workflow.Path, 'home', return_value=home), \
                  patch.object(workflow.shutil, 'which', return_value=None):
                 _, env = workflow.generation_job(cfg, home / 'job')
@@ -206,8 +232,8 @@ class HydraWorkflowTests(unittest.TestCase):
                 workflow.dispatch(cfg, Path(tmp) / 'single job')
             args, kwargs = execute.call_args
             self.assertEqual(args[0][-2:], ['opencode', 'local_opencode_smoke'])
-            self.assertEqual(kwargs['env']['LIMIT'], '1')
-            self.assertEqual(kwargs['env']['CONCURRENCY'], '1')
+            self.assertEqual(kwargs['env']['LIMIT'], '5')
+            self.assertEqual(kwargs['env']['CONCURRENCY'], '8')
             self.assertEqual(kwargs['env']['AGENT_TIMEOUT'], '42')
             self.assertEqual(kwargs['env']['SAVE_TRAJECTORIES'], 'true')
             cfg.generation.save_trajectories = False
@@ -220,8 +246,61 @@ class HydraWorkflowTests(unittest.TestCase):
             record = json.loads((Path(tmp) / 'single job/harness-version.json').read_text())
             self.assertEqual((record['harness'], record['opencode_version_validated']), ('opencode', '1.18.31'))
 
+    def test_codex_is_pinned_to_the_vendored_release(self):
+        cfg = config('harness=codex')
+        self.assertEqual(str(cfg.harness.version), '0.155.0')
+        if 'CODEX_BIN' not in os.environ:
+            self.assertEqual(cfg.harness.binary,
+                             str(ROOT / 'third_party/codex/0.155.0/codex-x86_64-unknown-linux-musl'))
+        archive = ROOT / 'third_party/codex/0.155.0/codex-x86_64-unknown-linux-musl.xz'
+        sums = dict(reversed(line.split('  ')) for line in
+                    (archive.parent / 'SHA256SUMS').read_text().splitlines())
+        import hashlib
+        self.assertEqual(hashlib.sha256(archive.read_bytes()).hexdigest(), sums[archive.name])
+        with tempfile.TemporaryDirectory() as tmp:
+            binary = Path(tmp) / 'codex'
+            for reported, fails in (('codex-cli 0.155.0', False), ('codex-cli 0.156.0', True)):
+                binary.write_text(f'#!/bin/sh\necho {reported}\n')
+                binary.chmod(0o755)
+                with self.subTest(reported=reported):
+                    if fails:
+                        with self.assertRaisesRegex(ValueError, 'pinned to 0.155.0'):
+                            workflow.record_harness_version(cfg, str(binary), Path(tmp))
+                    else:
+                        record = workflow.record_harness_version(cfg, str(binary), Path(tmp))
+                        self.assertEqual(record['pinned_version'], '0.155.0')
+
+    def test_vendored_binary_is_extracted_and_verified(self):
+        import hashlib, lzma
+        with tempfile.TemporaryDirectory() as tmp:
+            binary = Path(tmp) / 'tool'
+            data = b'#!/bin/sh\necho tool 1.0.0\n'
+            packed = lzma.compress(data)
+            (Path(tmp) / 'tool.xz').write_bytes(packed)
+            (Path(tmp) / 'SHA256SUMS').write_text(f"{hashlib.sha256(packed).hexdigest()}  tool.xz\n"
+                                                  f"{hashlib.sha256(data).hexdigest()}  tool\n")
+            with contextlib.redirect_stdout(io.StringIO()):
+                workflow.ensure_vendored_binary(binary)
+            self.assertEqual(binary.read_bytes(), data)
+            self.assertTrue(os.access(binary, os.X_OK))
+            binary.unlink()
+            (Path(tmp) / 'tool.xz').write_bytes(lzma.compress(b'tampered'))
+            with self.assertRaisesRegex(ValueError, 'Checksum mismatch'):
+                workflow.ensure_vendored_binary(binary)
+            self.assertFalse(binary.exists())
+
     def test_harness_version_is_recorded_and_mismatch_warned(self):
         cfg = config('action=generate', 'harness=opencode', 'server.host=127.0.0.1')
+        self.assertEqual(str(cfg.harness.version), '1.18.31')
+        if 'OPENCODE_BIN' not in os.environ:
+            self.assertEqual(cfg.harness.binary, str(ROOT / 'third_party/opencode/1.18.31/opencode-linux-x64'))
+        with tempfile.TemporaryDirectory() as tmp:
+            binary = Path(tmp) / 'opencode'
+            binary.write_text('#!/bin/sh\necho 2.0.1\n')
+            binary.chmod(0o755)
+            with self.assertRaisesRegex(ValueError, 'pinned to 1.18.31'):
+                workflow.record_harness_version(cfg, str(binary), Path(tmp))
+        cfg.harness.version = None  # unpinned: a rendered config only warns
         with tempfile.TemporaryDirectory() as tmp:
             binary = Path(tmp) / 'opencode'
             for reported, warned in (('1.18.31', False), ('2.0.1', True)):

@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """Hydra entry point for local serving and PatchEval generation/evaluation."""
 
+import datetime
+import hashlib
 import json
+import lzma
 import logging
 import os
 from pathlib import Path
@@ -67,6 +70,23 @@ def validate(cfg):
     if any(arg.split("=", 1)[0] in {"--override-generation-config", "--generation-config"}
            for arg in cfg.server.extra_args):
         raise ValueError("Set model.output_tokens/model.temperature instead of generation-config extra_args")
+    managed = {"--speculative-config", "-sc", "--enable-prefix-caching", "--no-enable-prefix-caching",
+               "--enable-chunked-prefill", "--no-enable-chunked-prefill", "--max-num-seqs"}
+    if any(arg.split("=", 1)[0] in managed for arg in cfg.server.extra_args):
+        raise ValueError("Set server.speculative/prefix_caching/chunked_prefill/max_running_requests "
+                         "instead of passing those flags in server.extra_args")
+    for key in ("prefix_caching", "chunked_prefill"):
+        if not isinstance(cfg.server.get(key, True), bool):
+            raise ValueError(f"server.{key} must be a boolean")
+    speculative = cfg.server.get("speculative")
+    if speculative is not None:
+        if not OmegaConf.is_dict(speculative) or not isinstance(speculative.get("method"), str):
+            raise ValueError("server.speculative must be null or a mapping with a method")
+        positive(speculative.get("num_speculative_tokens"), "server.speculative.num_speculative_tokens")
+    slots = cfg.server.data_parallel * cfg.server.max_running_requests
+    if cfg.action == "generate" and cfg.generation.concurrency > slots:
+        print(f"WARNING: generation.concurrency={cfg.generation.concurrency} exceeds the server's "
+              f"{slots} running-request slots; extra model calls will queue", file=sys.stderr)
 
 
 def bridge_host():
@@ -129,7 +149,43 @@ def serve_command(cfg):
     if cfg.model.get("temperature") is not None:
         generation["temperature"] = cfg.model.temperature
     args.extend(["--override-generation-config", json.dumps(generation)])
+    # Lossless accelerations, emitted explicitly so the recorded argv states them
+    # even where they match vLLM's defaults.
+    speculative = cfg.server.get("speculative")
+    if speculative is not None:
+        args.extend(["--speculative-config", json.dumps(OmegaConf.to_container(speculative, resolve=True))])
+    for key, flag in (("prefix_caching", "prefix-caching"), ("chunked_prefill", "chunked-prefill")):
+        if cfg.server.get(key) is not None:
+            args.append(f"--{'' if cfg.server[key] else 'no-'}enable-{flag}")
     return args + list(cfg.server.extra_args)
+
+
+def current_server_file(cfg):
+    return absolute(cfg.paths.runtime) / "current-server.json"
+
+
+def record_server(cfg, output):
+    """Copy the last server started by this workflow into a generation invocation."""
+    source = current_server_file(cfg)
+    if not source.is_file():
+        print(f"WARNING: {source} not found; the serving configuration is not recorded "
+              "(start the server with action=serve to record it)", file=sys.stderr)
+        return None
+    record = json.loads(source.read_text())
+    (output / "server.json").write_text(json.dumps(record, indent=2) + "\n")
+    return record
+
+
+def check_resume_server(target, record):
+    stored = target / "server.json"
+    if not stored.is_file() or record is None:
+        print(f"WARNING: cannot confirm that {target} was generated with the current server "
+              "configuration (no server record on one side)", file=sys.stderr)
+        return
+    previous = json.loads(stored.read_text())
+    if (previous.get("argv"), previous.get("vllm")) != (record.get("argv"), record.get("vllm")):
+        raise ValueError(f"The serving configuration differs from the one {target} was generated "
+                         "with; restart the server with its recorded settings (server.json) to resume")
 
 
 SAMPLE_DIR = re.compile(r"sample_(\d+)")
@@ -206,10 +262,36 @@ def find_run(cfg):
     return runs[0]
 
 
+def ensure_vendored_binary(path):
+    """Extract a vendored `<binary>.xz` next to itself, verifying SHA256SUMS."""
+    archive = path.with_name(path.name + ".xz")
+    if path.exists() or not archive.is_file():
+        return
+    sums = {}
+    for line in (path.parent / "SHA256SUMS").read_text().splitlines():
+        digest, _, name = line.strip().partition("  ")
+        sums[name] = digest
+    def digest(data):
+        return hashlib.sha256(data).hexdigest()
+    packed = archive.read_bytes()
+    if digest(packed) != sums.get(archive.name):
+        raise ValueError(f"Checksum mismatch for {archive}")
+    data = lzma.decompress(packed)
+    if digest(data) != sums.get(path.name):
+        raise ValueError(f"Checksum mismatch after extracting {archive}")
+    partial = path.with_name(path.name + ".partial")
+    partial.write_bytes(data)
+    partial.chmod(0o755)
+    partial.replace(path)
+    print(f"Extracted vendored harness binary: {path}", flush=True)
+
+
 def generation_job(cfg, output, harness_home=None):
     binary = str(cfg.harness.binary)
     if "/" in binary:
         binary = str(absolute(binary))
+        if not cfg.dry_run:
+            ensure_vendored_binary(Path(binary))
     else:
         resolved = shutil.which(binary)
         # The OpenCode installer updates .bashrc, which zsh and noninteractive
@@ -260,6 +342,13 @@ def record_harness_version(cfg, binary, output):
     version = (re.search(r"\d+\.\d+\.\d+", text) or [None])[0]
     record = {"harness": cfg.harness.name, "binary": str(Path(binary).resolve()), "version": version,
               "version_output": text}
+    pinned = cfg.harness.get("version")
+    if pinned is not None:
+        record["pinned_version"] = str(pinned)
+        if version != str(pinned):
+            raise ValueError(f"{cfg.harness.name} is pinned to {pinned}, but {binary} reports "
+                             f"{version or 'an unknown version'}; set harness.binary to the pinned "
+                             "release or override harness.version")
     if cfg.harness.name == "opencode" and not cfg.harness.config:
         record["opencode_version_validated"] = OPENCODE_VERSION
         if version != OPENCODE_VERSION:
@@ -374,6 +463,13 @@ def dispatch(cfg, output):
         subprocess.run([str(python), "-c", 'import vllm, pathlib, sysconfig; assert (pathlib.Path(sysconfig.get_path("include")) / "Python.h").exists(), "Python development headers are required"'], check=True)
         version = subprocess.check_output([str(python), "-c", 'import importlib.metadata; print(importlib.metadata.version("vllm"))'], text=True).strip()
         (output / "server-version.json").write_text(json.dumps({"vllm": version}) + "\n")
+        # Generation invocations copy this record, so each run states the engine
+        # settings it was sampled under and resumes can refuse a changed server.
+        current = current_server_file(cfg)
+        current.parent.mkdir(parents=True, exist_ok=True)
+        current.write_text(json.dumps({
+            "argv": command[1:], "vllm": version, "serve_invocation": str(output),
+            "started_utc": datetime.datetime.now(datetime.timezone.utc).isoformat()}, indent=2) + "\n")
         logging.shutdown()
         os.execvpe(command[0], command, {**os.environ, **env})
     elif cfg.action == "configure":
@@ -435,8 +531,10 @@ def dispatch(cfg, output):
         prefix = {"codex": "CODEX", "opencode": "OPENCODE", "traecli": "TRAE"}[cfg.harness.name]
         if not cfg.dry_run:
             record = record_harness_version(cfg, env[f"{prefix}_BIN"], output)
-            if harness_home is not None:
+            server = record_server(cfg, output)
+            if target != output:
                 check_resume_version(target, record)
+                check_resume_server(target, server)
         # Independent samples for pass@k run one after another against the same
         # server and harness config, each in its own generation/sample_<i>/.
         samples = cfg.generation.samples
@@ -460,7 +558,7 @@ def dispatch(cfg, output):
                 else:
                     print(f"Sample {index} completed with failed tasks (runner exit {exc.returncode}); "
                           "continuing", flush=True)
-        if harness_home is not None and not cfg.dry_run:
+        if target != output and not cfg.dry_run:
             with (target / "resumed_by.jsonl").open("a", encoding="utf-8") as log:
                 log.write(json.dumps({"invocation": str(output), "samples": list(pending),
                                       "incomplete": incomplete}) + "\n")

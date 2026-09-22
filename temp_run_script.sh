@@ -14,10 +14,12 @@ set -euo pipefail
 #   bash temp_run_script.sh smoke
 # Inspect smoke summaries/logs, then run generation followed by evaluation:
 #   bash temp_run_script.sh full
-# OpenCode is found on PATH or at ~/.opencode/bin/opencode (no .bashrc needed).
-# OPENCODE_BIN=/absolute/path/to/opencode overrides executable discovery.
+# Codex 0.155.0 and OpenCode 1.18.31 are pinned: generation uses the vendored
+# binaries under third_party/ (extracted and checksum-verified on first use) and
+# refuses other versions. CODEX_BIN/OPENCODE_BIN override them only together
+# with a matching harness.version.
 # Choose a harness or override concurrency explicitly:
-#   HARNESS=opencode CONCURRENCY=8 MAX_WORKERS=16 bash temp_run_script.sh full
+#   HARNESS=opencode CONCURRENCY=48 MAX_WORKERS=16 bash temp_run_script.sh full
 # Artifacts default to patcheval/exp_agent/agent_runs/; RUNS_DIR overrides it.
 # Relative RUNS_DIR and evaluation paths are relative to the repository root.
 # Model caches and the serving environment remain under RUNTIME_DIR.
@@ -29,13 +31,15 @@ set -euo pipefail
 # Generate an invocation's missing samples (same settings), then evaluate all:
 #   MAX_WORKERS=16 bash temp_run_script.sh resume /path/to/hydra/vllm-full-XXXXXXXX
 #
-# CONCURRENCY=8 matches DP=8 * max-num-seqs=1 active model requests.
-# vLLM's limit is per replica:
+# The server defaults (scripts/conf/config.yaml) run 8 replicas x 8 requests
+# (max-num-seqs is per replica) with MTP speculative decoding, prefix caching,
+# and chunked prefill. CONCURRENCY=48 keeps ~6 agent sessions per GPU, since
+# agents spend part of each turn in tools, while their resident context stays
+# within the ~900k-token BF16 KV budget per H200:
 # https://docs.vllm.ai/en/latest/serving/data_parallel_deployment/
-# Try 16 generation tasks only after measuring an 8-task baseline: tasks doing
-# tool work can leave GPUs idle, but extra tasks also add queueing to agent timeouts.
-# Keep server max-num-seqs=1 initially for the 262,144-token context. Increasing
-# it requires restarting the server and measuring GPU memory at long contexts.
+# More concurrency also slows each request, so the fixed agent timeout binds
+# sooner; compare timeouts before raising it. Restart the server to apply new
+# serving defaults, but never while a generation run is in progress.
 # MAX_WORKERS=16 is a starting point, not a measured optimum. Evaluation is
 # CPU/I/O work, not GPU inference; containers have no CPU cap and builds can
 # spawn many threads. Compare 8/16/32 workers on the SAME completed run; select
@@ -54,7 +58,7 @@ SERVER_HOST="${SERVER_HOST:-172.17.0.1}"
 SERVER_PORT="${SERVER_PORT:-30000}"
 SERVER_WAIT_TIMEOUT="${SERVER_WAIT_TIMEOUT:-900}"
 HARNESS="${HARNESS:-codex}"
-CONCURRENCY="${CONCURRENCY:-8}"
+CONCURRENCY="${CONCURRENCY:-48}"
 MAX_WORKERS="${MAX_WORKERS:-16}"
 AGENT_TIMEOUT="${AGENT_TIMEOUT:-2400}"
 # Independent generation runs per case; evaluation reports pass@1..pass@SAMPLES.
@@ -136,9 +140,9 @@ case "${1:-help}" in
     "${workflow[@]}" action=setup
     ;;
   serve)
+    # Serving settings (batching, MTP, caching) come from scripts/conf/config.yaml.
     "${workflow[@]}" action=serve 'server.gpu="0,1,2,3,4,5,6,7"' \
-      server.tensor_parallel=1 server.data_parallel=8 \
-      server.max_running_requests=1 model.context_length=262144
+      server.tensor_parallel=1 server.data_parallel=8 model.context_length=262144
     ;;
   check)
     wait_for_server
@@ -198,7 +202,7 @@ case "${1:-help}" in
     ;;
   help|-h|--help)
     echo 'Usage: bash temp_run_script.sh {setup|serve|check|smoke|full|resume INVOCATION|evaluate RUN_DIR}'
-    echo 'Defaults: CONCURRENCY=8 MAX_WORKERS=16 HARNESS=codex AGENT_TIMEOUT=2400 SAMPLES=4'
+    echo 'Defaults: CONCURRENCY=48 MAX_WORKERS=16 HARNESS=codex AGENT_TIMEOUT=2400 SAMPLES=4'
     echo 'Start serve in another terminal, run smoke, inspect outputs, then run full.'
     echo 'See comments in this script for overrides and tuning guidance.'
     ;;
