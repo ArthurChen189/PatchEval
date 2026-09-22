@@ -43,7 +43,9 @@ check:
 generation:
   limit: -1
   concurrency: 1
-  timeout: 3600
+  timeout: 2400 # Agent wall-clock budget per task in seconds (40 minutes).
+  samples: 4 # Independent generation runs per case; evaluation reports pass@1..pass@samples.
+  resume_dir: null # A previous generation invocation: generate only its missing samples, with its settings.
   save_trajectories: true # Preserve per-task prompts, events, stderr, and native sessions.
 
 analysis:
@@ -54,6 +56,7 @@ evaluation:
   run_dir: null # null selects the newest completed run matching label under paths.runs.
   max_workers: 1
   log_level: INFO
+  allow_partial: false # Score only completed samples when some are missing (marked partial).
 
 hydra:
   job:

@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_AGENT_TIMEOUT_S = 3600
+DEFAULT_AGENT_TIMEOUT_S = 2400
 STREAM_READER_LIMIT = 16 * 1024 * 1024
 
 

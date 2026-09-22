@@ -55,7 +55,7 @@ class ArtifactPathTests(unittest.TestCase):
             self.assertIn(str(output / 'analysis'), printed.getvalue())
             cfg.evaluation.run_dir = str(output / 'generation' / 'completed')
             (Path(cfg.evaluation.run_dir) / 'patches').mkdir(parents=True)
-            _, jobs = workflow.evaluation_jobs(cfg, output)
+            _, jobs, _ = workflow.evaluation_jobs(cfg, output)
             convert, _ = jobs[0]
             self.assertEqual(convert[convert.index('--process-data-path') + 1], str(output / 'eval_inputs/patches.jsonl'))
             evaluate, cwd = jobs[1]

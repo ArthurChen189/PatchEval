@@ -21,8 +21,13 @@ set -euo pipefail
 # Artifacts default to patcheval/exp_agent/agent_runs/; RUNS_DIR overrides it.
 # Relative RUNS_DIR and evaluation paths are relative to the repository root.
 # Model caches and the serving environment remain under RUNTIME_DIR.
-# Re-evaluate an existing generation run, without generating again:
+# SAMPLES=4 runs four independent generations per case for pass@4; SAMPLES=1
+# gives a quicker smoke test. Re-evaluate without generating again, passing a
+# single run, any sample run, or a multi-sample invocation directory; every
+# sample of the invocation is evaluated and pass_at_k.json is written:
 #   MAX_WORKERS=16 bash temp_run_script.sh evaluate /absolute/path/to/generation/run
+# Generate an invocation's missing samples (same settings), then evaluate all:
+#   MAX_WORKERS=16 bash temp_run_script.sh resume /path/to/hydra/vllm-full-XXXXXXXX
 #
 # CONCURRENCY=8 matches DP=8 * max-num-seqs=1 active model requests.
 # vLLM's limit is per replica:
@@ -51,7 +56,9 @@ SERVER_WAIT_TIMEOUT="${SERVER_WAIT_TIMEOUT:-900}"
 HARNESS="${HARNESS:-codex}"
 CONCURRENCY="${CONCURRENCY:-8}"
 MAX_WORKERS="${MAX_WORKERS:-16}"
-AGENT_TIMEOUT="${AGENT_TIMEOUT:-3600}"
+AGENT_TIMEOUT="${AGENT_TIMEOUT:-2400}"
+# Independent generation runs per case; evaluation reports pass@1..pass@SAMPLES.
+SAMPLES="${SAMPLES:-4}"
 
 workflow=(bash "${REPO_ROOT}/scripts/run.sh"
   "paths.runtime=${RUNTIME_DIR}" "paths.runs=${RUNS_DIR}"
@@ -156,30 +163,42 @@ case "${1:-help}" in
     label="qwen_vllm_${HARNESS}_${experiment}_$(date -u +%Y%m%d_%H%M%S)"
     "${workflow[@]}" action=generate "experiment=${experiment}" "label=${label}" \
       "hydra.run.dir=${job_dir}" "generation.concurrency=${concurrency}" \
-      "generation.timeout=${AGENT_TIMEOUT}" generation.save_trajectories=true
-    shopt -s nullglob
-    generation_runs=("${job_dir}"/generation/*)
-    if [[ ${#generation_runs[@]} -ne 1 || ! -f "${generation_runs[0]}/summary.json" ]]; then
-      echo "Expected one completed generation run under ${job_dir}/generation" >&2
-      exit 1
-    fi
-    run_dir="${generation_runs[0]}"
-    printf 'Evaluating generation run: %s\n' "$run_dir"
+      "generation.timeout=${AGENT_TIMEOUT}" "generation.samples=${SAMPLES}" \
+      generation.save_trajectories=true
+    # Evaluation checks that every configured sample completed, evaluates each,
+    # and writes pass_at_k.json in its invocation directory.
+    printf 'Evaluating %s generation sample(s) in: %s\n' "$SAMPLES" "$job_dir"
     "${workflow[@]}" action=evaluate "label=${label}" \
-      "evaluation.run_dir=${run_dir}" "evaluation.max_workers=${workers}"
+      "evaluation.run_dir=${job_dir}" "evaluation.max_workers=${workers}"
     ;;
-  evaluate)
+  resume)
     if [[ $# -ne 2 ]]; then
-      echo "Usage: bash temp_run_script.sh evaluate /absolute/path/to/generation/run" >&2
+      echo "Usage: bash temp_run_script.sh resume /path/to/generation/invocation" >&2
       exit 2
     fi
+    # Generates only the missing samples, with the invocation's own recorded
+    # model, harness, label, and generation settings, then evaluates all samples.
     ensure_docker "$@"
+    wait_for_server
+    "${workflow[@]}" action=check
+    "${workflow[@]}" action=generate "generation.resume_dir=$2"
     "${workflow[@]}" action=evaluate "evaluation.run_dir=$2" \
       "evaluation.max_workers=${MAX_WORKERS}"
     ;;
+  evaluate)
+    if [[ $# -ne 2 ]]; then
+      echo "Usage: bash temp_run_script.sh evaluate /path/to/generation/run-sample-or-invocation" >&2
+      exit 2
+    fi
+    ensure_docker "$@"
+    # Any sample run path evaluates every sample of its invocation. PARTIAL=1
+    # scores only completed samples when some are missing (marked partial).
+    "${workflow[@]}" action=evaluate "evaluation.run_dir=$2" \
+      "evaluation.max_workers=${MAX_WORKERS}" "evaluation.allow_partial=${PARTIAL:-false}"
+    ;;
   help|-h|--help)
-    echo 'Usage: bash temp_run_script.sh {setup|serve|check|smoke|full|evaluate RUN_DIR}'
-    echo 'Defaults: CONCURRENCY=8 MAX_WORKERS=16 HARNESS=codex AGENT_TIMEOUT=3600'
+    echo 'Usage: bash temp_run_script.sh {setup|serve|check|smoke|full|resume INVOCATION|evaluate RUN_DIR}'
+    echo 'Defaults: CONCURRENCY=8 MAX_WORKERS=16 HARNESS=codex AGENT_TIMEOUT=2400 SAMPLES=4'
     echo 'Start serve in another terminal, run smoke, inspect outputs, then run full.'
     echo 'See comments in this script for overrides and tuning guidance.'
     ;;

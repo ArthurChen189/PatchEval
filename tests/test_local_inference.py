@@ -26,15 +26,24 @@ checks = module('check_server')
 class ConfigTests(unittest.TestCase):
     def test_configs_match_adapter_layout_and_limits(self):
         with tempfile.TemporaryDirectory(prefix='local inference ') as directory:
-            output = configs.configure(directory, 'http://172.17.0.1:30000/v1/', 'Qwen/Qwen3.8-27B', 65536)
+            output = configs.configure(directory, 'http://172.17.0.1:30000/v1/', 'Qwen/Qwen3.8-27B', 65536,
+                                       temperature=0)
             codex = tomllib.loads((output / 'codex/config.toml').read_text())
             self.assertEqual(codex['model_provider'], 'vllm')
             self.assertNotIn('profiles', codex)
             self.assertEqual(codex['model_providers']['vllm']['wire_api'], 'responses')
-            self.assertEqual(codex['model_auto_compact_token_limit'], 57344)
+            self.assertEqual(codex['model_auto_compact_token_limit'], 49536)
             self.assertEqual((output / 'codex/local.config.toml').read_text(), (output / 'codex/config.toml').read_text())
             opencode = json.loads((output / 'opencode/config/opencode/opencode.json').read_text())
             self.assertEqual(opencode['model'], 'vllm/Qwen/Qwen3.8-27B')
+            self.assertEqual(opencode['provider']['vllm']['models']['Qwen/Qwen3.8-27B']['limit'],
+                             {'context': 65536, 'output': 16000})
+            self.assertEqual(opencode['agent'], {name: {'temperature': 0} for name in configs.OPENCODE_AGENTS})
+            # Without this capability flag OpenCode 1.18.31 drops agent temperatures.
+            self.assertIs(opencode['provider']['vllm']['models']['Qwen/Qwen3.8-27B']['temperature'], True)
+            self.assertNotIn('temperature', codex)
+            manifest = json.loads((output / 'config-manifest.json').read_text())
+            self.assertEqual((manifest['output_tokens'], manifest['temperature']), (16000, 0))
             self.assertTrue((output / 'opencode/data').is_dir())
             with self.assertRaises(FileExistsError):
                 configs.configure(directory, 'http://host/v1', 'different', 65536)
@@ -48,6 +57,16 @@ class ConfigTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     configs.configure(output, url, 'model', 65536)
             self.assertFalse(output.exists())
+
+    def test_temperature_validation_and_omission(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for value in (-1, True, 'zero'):
+                with self.assertRaises(ValueError):
+                    configs.configure(Path(directory) / 'bad', 'http://host/v1', 'model', 65536, temperature=value)
+            output = configs.configure(Path(directory) / 'none', 'http://host/v1', 'model', 65536, temperature=None)
+            rendered = json.loads((output / 'opencode/config/opencode/opencode.json').read_text())
+            self.assertNotIn('agent', rendered)
+            self.assertNotIn('temperature', rendered['provider']['vllm']['models']['model'])
 
 
 class ProtocolTests(unittest.TestCase):

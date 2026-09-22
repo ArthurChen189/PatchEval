@@ -27,7 +27,7 @@
 # 📊  Full Benchmark Run:
 #     experiment=full     # Use after inspecting smoke test results
 #     label=new_label     # Each run should have a unique label
-#     generation.timeout=3600   # (optional) Adjust agent timeout if needed
+#     generation.timeout=2400   # (optional) Adjust agent timeout if needed
 #
 # 📂  Results:
 #     Generation prints the run directory.

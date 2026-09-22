@@ -74,6 +74,8 @@ class HydraWorkflowTests(unittest.TestCase):
                             '--tool-call-parser': 'qwen3_xml'}.items():
             self.assertEqual(command[command.index(flag) + 1], value)
         self.assertIn('--enable-auto-tool-choice', command)
+        generation = json.loads(command[command.index('--override-generation-config') + 1])
+        self.assertEqual(generation, {'max_new_tokens': 16000})
         self.assertEqual(workflow.serving_environment(cfg)['CUDA_VISIBLE_DEVICES'], '0,1,2,3,4,5,6,7')
         cfg.server.tensor_parallel, cfg.server.data_parallel = 2, 4
         cfg.model.tool_call_parser = None
@@ -81,6 +83,20 @@ class HydraWorkflowTests(unittest.TestCase):
         self.assertEqual(command[command.index('--tensor-parallel-size') + 1], '2')
         self.assertEqual(command[command.index('--data-parallel-size') + 1], '4')
         self.assertNotIn('--enable-auto-tool-choice', command)
+
+    def test_uniform_generation_defaults(self):
+        cfg = config('server.host=127.0.0.1')
+        self.assertEqual((cfg.model.output_tokens, cfg.model.temperature, cfg.generation.timeout,
+                          cfg.generation.samples), (16000, None, 2400, 4))
+        cfg.model.temperature = 0.6
+        command = workflow.serve_command(cfg)
+        self.assertEqual(json.loads(command[command.index('--override-generation-config') + 1]),
+                         {'max_new_tokens': 16000, 'temperature': 0.6})
+        for overrides in (['model.temperature=-0.5'], ['model.temperature=true'], ['generation.samples=0'],
+                          ["server.extra_args=[--override-generation-config,'{}']"],
+                          ["server.extra_args=['--generation-config=vllm']"]):
+            with self.subTest(overrides=overrides), self.assertRaises(ValueError):
+                workflow.validate(config('server.host=127.0.0.1', *overrides))
 
     def test_serving_dry_runs_never_execute(self):
         for action in ('setup', 'serve'):
@@ -178,8 +194,16 @@ class HydraWorkflowTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix='generation paths ') as tmp:
             cfg.paths.runs = tmp
             with patch.dict(os.environ, {'LIMIT': '230', 'CONCURRENCY': '99'}):
-                with patch.object(workflow.subprocess, 'run') as execute:
+                with patch.object(workflow.subprocess, 'run') as execute, \
+                     patch.object(workflow.subprocess, 'check_output', return_value='1.18.31\n'):
                     workflow.dispatch(cfg, Path(tmp) / 'hydra job')
+            self.assertEqual(execute.call_count, 4)
+            self.assertEqual([call.kwargs['env']['OUTPUT_BASE'] for call in execute.call_args_list],
+                             [str(Path(tmp) / f'hydra job/generation/sample_{i}') for i in range(4)])
+            cfg.generation.samples = 1
+            with patch.object(workflow.subprocess, 'run') as execute, \
+                 patch.object(workflow.subprocess, 'check_output', return_value='1.18.31\n'):
+                workflow.dispatch(cfg, Path(tmp) / 'single job')
             args, kwargs = execute.call_args
             self.assertEqual(args[0][-2:], ['opencode', 'local_opencode_smoke'])
             self.assertEqual(kwargs['env']['LIMIT'], '1')
@@ -190,9 +214,28 @@ class HydraWorkflowTests(unittest.TestCase):
             cfg.dry_run = True
             _, disabled_env = workflow.generation_job(cfg, Path(tmp))
             self.assertEqual(disabled_env['SAVE_TRAJECTORIES'], 'false')
-            self.assertEqual(kwargs['env']['OUTPUT_BASE'], str(Path(tmp) / 'hydra job/generation'))
+            self.assertEqual(kwargs['env']['OUTPUT_BASE'], str(Path(tmp) / 'single job/generation'))
             self.assertTrue(Path(kwargs['env']['OPENCODE_CONFIG']).is_file())
             self.assertEqual(kwargs['cwd'], ROOT)
+            record = json.loads((Path(tmp) / 'single job/harness-version.json').read_text())
+            self.assertEqual((record['harness'], record['opencode_version_validated']), ('opencode', '1.18.31'))
+
+    def test_harness_version_is_recorded_and_mismatch_warned(self):
+        cfg = config('action=generate', 'harness=opencode', 'server.host=127.0.0.1')
+        with tempfile.TemporaryDirectory() as tmp:
+            binary = Path(tmp) / 'opencode'
+            for reported, warned in (('1.18.31', False), ('2.0.1', True)):
+                binary.write_text(f'#!/bin/sh\necho {reported}\n')
+                binary.chmod(0o755)
+                with self.subTest(reported=reported), contextlib.redirect_stderr(io.StringIO()) as err:
+                    record = workflow.record_harness_version(cfg, str(binary), Path(tmp))
+                self.assertEqual(record['version'], reported)
+                self.assertEqual('WARNING' in err.getvalue(), warned)
+            cfg.harness.name = 'codex'
+            binary.write_text('#!/bin/sh\necho codex-cli 0.155.1\n')
+            record = workflow.record_harness_version(cfg, str(binary), Path(tmp))
+            self.assertEqual(record['version'], '0.155.1')
+            self.assertNotIn('opencode_version_validated', record)
 
     def test_explicit_harness_config_does_not_need_docker_or_rendering(self):
         cfg = config('action=generate', 'harness=traecli')
@@ -217,10 +260,10 @@ class HydraWorkflowTests(unittest.TestCase):
                     (path / 'summary.json').write_text('{}')
                 os.utime(path, (timestamp, timestamp))
             self.assertEqual(workflow.find_run(cfg).name, 'newer-example')
-            run, jobs = workflow.evaluation_jobs(cfg, Path(tmp) / 'evaluation job')
+            runs, jobs, _ = workflow.evaluation_jobs(cfg, Path(tmp) / 'evaluation job')
             convert, _ = jobs[0]
             command, cwd = jobs[1]
-            self.assertEqual(convert[convert.index('--runner-output') + 1], str(run))
+            self.assertEqual(convert[convert.index('--runner-output') + 1], str(runs[0]))
             self.assertEqual(command[command.index('--max_workers') + 1], '1')
             output = (cwd / 'evaluation_output' / command[command.index('--output') + 1]).resolve()
             self.assertEqual(output, Path(tmp) / 'evaluation job/evaluation_output')

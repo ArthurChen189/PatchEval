@@ -51,5 +51,5 @@ python "${SCRIPT_DIR}/patch_agent_runner.py" \
   "${AGENT_EXTRA_ARGS[@]}" \
   "${trajectory_args[@]}" \
   --agent-command "$AGENT_COMMAND" \
-  --agent-timeout "${AGENT_TIMEOUT:-3600}" \
+  --agent-timeout "${AGENT_TIMEOUT:-2400}" \
   --container-prefix "patcheval-${AGENT}"

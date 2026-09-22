@@ -99,7 +99,27 @@ GPU, so data parallel replicas raise throughput instead of tensor-sharding the
 weights), a 262,144-token context, `server.memory_fraction=0.85`, and one active request
 per replica (`--max-num-seqs 1`). vLLM balances requests across replicas behind
 one endpoint. Automatic tool choice is enabled.
-Thinking uses the checkpoint defaults. The `qwen3` reasoning and `qwen3_xml`
+Thinking and sampling use the checkpoint defaults: `model.temperature=null`
+sends no temperature from the server or any harness, so vLLM applies the
+model's `generation_config.json` (its startup log reports the defaults).
+Serving passes `--override-generation-config '{"max_new_tokens": 16000}'` from
+`model.output_tokens`; in vLLM 0.29.0 `max_new_tokens` is a server-wide hard cap
+on Chat Completions and Responses requests (min of the request's own limit, the
+cap, and remaining context). Rendered OpenCode configs also set `limit.output`
+to the cap. Codex has no official output-cap or temperature key; Codex 0.155.0
+and 0.155.1 were observed to send neither, and OpenCode 1.18.31 sends no
+temperature for custom models unless configured, so every harness gets the
+model default. Setting `model.temperature` to a number instead adds it to the
+server override (the default for requests that omit one: Codex, TraeCLI) and
+renders OpenCode's [agent temperature](https://opencode.ai/docs/agents/#temperature)
+on every built-in agent of OpenCode 1.18.31 (build, plan, general, explore,
+compaction, summary, title) together with the model's `"temperature": true`
+capability flag, without which 1.18.31 silently drops agent temperatures.
+Newer OpenCode docs mention a `scout` agent and a 0.55 Qwen default; neither
+applies to 1.18.31, so do not copy newer-doc agent names into these configs.
+Set generation settings through these model fields;
+`--override-generation-config`/`--generation-config` in `server.extra_args` are
+rejected. Restart a running server after changing them. The `qwen3` reasoning and `qwen3_xml`
 tool parsers are enabled. vLLM is pinned to 0.29.0; setup uses managed Python 3.12 with the development headers required
 by Triton. Serving needs a C compiler and a compatible CUDA toolkit; initial
 kernel compilation can take minutes. See the
@@ -139,7 +159,7 @@ credential for serving and checks; checks accept `SGLANG_API_KEY` as a deprecate
 fallback, with `VLLM_API_KEY` taking precedence. Configure matching credentials
 in custom harness profiles when authentication is enabled.
 
-Model path/name, context/output limits, and parsers live in the model YAML.
+Model path/name, context length, per-response output cap, sampling temperature, and parsers live in the model YAML.
 GPU selection, tensor/data parallelism, dtype, memory, and concurrency live in
 `server`. Extra serving arguments are literal list entries, for example
 `'server.extra_args=[--enforce-eager]'`. Prefer named configuration
@@ -247,8 +267,34 @@ and the previous flat layout. For custom `hydra.run.dir` or `hydra.sweep.dir`
 locations outside this layout, supply `evaluation.run_dir` explicitly. A run
 with recorded failures is still completed and is included in evaluation.
 Set `paths.dataset`, `generation.limit`, `generation.concurrency`,
-`generation.timeout`, `evaluation.max_workers`, and `evaluation.log_level` in
-YAML or as CLI overrides. Evaluation never implicitly starts generation. Each evaluation invocation
+`generation.timeout`, `generation.samples`, `evaluation.max_workers`, and
+`evaluation.log_level` in YAML or as CLI overrides.
+
+`generation.samples=4` (the default) runs four independent generations of every
+case, one after another, into `generation/sample_<i>/` of the same invocation.
+The runner exits 1 whenever any task fails; a sample whose run still completed
+(`summary.json` written) counts as complete and the next sample starts, and
+only samples without a completed run are reported as failed at the end.
+Evaluation accepts that invocation, its `generation/` directory, a `sample_<i>`
+directory, or any sample's run directory as `evaluation.run_dir` (all expand to
+every sample of the invocation), or finds it by `label`. It refuses to score
+unless every configured sample completed; the error names the missing samples
+and the resume command. `evaluation.allow_partial=true` (`PARTIAL=1` in
+`temp_run_script.sh evaluate`) scores only the completed samples and marks
+`pass_at_k.json` as `partial`. `generation.resume_dir=<invocation>` (or
+`bash temp_run_script.sh resume <invocation>`) generates only the missing
+samples into that invocation: it adopts the invocation's recorded model,
+harness, label, endpoint, dataset, and generation settings, reuses its rendered
+`harnesses/` configs, refuses to continue if the harness CLI version differs
+from the recorded `harness-version.json`, and appends to `resumed_by.jsonl`. Each sample is converted and evaluated into
+`eval_inputs/sample_<i>/` and `evaluation_output/sample_<i>/`, and
+`pass_at_k.json` reports pass@1 through pass@samples overall and per language,
+using the unbiased estimator 1 - C(n-c,k)/C(n,k); pass@1 is the mean
+single-sample solve rate over all samples, and pass@4 with four samples is the
+fraction of cases solved at least once. Per-sample solve counts and evaluator
+execution errors are included for inspection. `generation.samples=1` keeps the
+previous single-run layout; legacy single runs are evaluated as before, with a
+one-sample `pass_at_k.json`. Evaluation never implicitly starts generation. Each evaluation invocation
 stores conversion input in its own `eval_inputs/` directory and reports/logs in
 its own `evaluation_output/` directory; repeated labels do not overwrite prior
 reports. The conversion and evaluator Python entry points are unchanged.
@@ -279,11 +325,15 @@ bash scripts/run.sh action=configure configure.output_dir=/path/to/harnesses
 ```
 
 Existing generated files are protected unless `configure.force=true`. The
-Codex home contains `config.toml` and `local.config.toml`; Codex 0.154.0 loads
-named profiles from the latter, so do not add legacy `[profiles.local]` tables.
+Codex home contains `config.toml` and `local.config.toml`; Codex 0.154.0 and
+later load named profiles from the latter, so do not add legacy `[profiles.local]` tables.
 OpenCode receives its expected XDG config/data layout. The integration was
-checked with Codex 0.154.0 and OpenCode 1.18.31. Record CLI versions alongside
-benchmark outputs. To sweep generation settings, use Hydra `--multirun`, e.g.
+checked with Codex 0.154.0, 0.155.0, and 0.155.1 and OpenCode 1.18.31. The
+standalone Codex install updates itself, so a bare `codex` can change between
+runs; set `harness.binary` to a release path under
+`~/.codex/packages/standalone/releases/` to pin it. Each generation records the
+CLI version in `harness-version.json` beside `resolved.yaml`, and warns when a
+rendered OpenCode config is used with a release other than 1.18.31. To sweep generation settings, use Hydra `--multirun`, e.g.
 `bash scripts/run.sh --multirun action=generate experiment=smoke harness=codex,opencode`.
 The default Hydra launcher runs sweep jobs sequentially; avoid serving sweeps
 on a shared GPU/port.
@@ -392,7 +442,8 @@ destination. On other hosts, configure Docker's data-root **and** containerd's
 needs socket access (`docker` group or equivalent); a missing SDK in system
 Python is unrelated to disk layout.
 
-The existing runner defaults to `AGENT_TIMEOUT=3600` seconds. A timed-out agent
+The runner defaults to `AGENT_TIMEOUT=2400` seconds (40 minutes; Hydra
+`generation.timeout=2400`). A timed-out agent
 produces an empty submitted patch, even if it changed its working tree before
 timeout, because patch collection requires a successful agent exit. Choose a
 time budget suitable for local generation speed when measuring repair success.

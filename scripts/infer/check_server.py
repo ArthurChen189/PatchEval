@@ -60,12 +60,12 @@ class Client:
                 yield event
 
 
-def chat(client, model):
+def chat(client, model, max_tokens=16000):
     messages = [{"role": "user", "content": PROMPT}]
     payload = {"model": model, "messages": messages,
                "tools": [{"type": "function", "function": FUNCTION}],
                "tool_choice": {"type": "function", "function": {"name": FUNCTION["name"]}},
-               "max_tokens": 8192}
+               "max_tokens": max_tokens}
     calls = {}
     for event in client.stream("/chat/completions", payload):
         for choice in event.get("choices", []):
@@ -91,12 +91,12 @@ def chat(client, model):
         raise ValueError("Chat Completions did not return the tool result")
 
 
-def responses(client, model):
+def responses(client, model, max_tokens=16000):
     inputs = [{"role": "user", "content": PROMPT}]
     payload = {"model": model, "input": inputs, "store": False,
                "tools": [{"type": "function", **FUNCTION}],
                "tool_choice": {"type": "function", "name": FUNCTION["name"]},
-               "max_output_tokens": 8192}
+               "max_output_tokens": max_tokens}
     completed = None
     for event in client.stream("/responses", payload):
         if event.get("type") == "response.completed":
@@ -122,7 +122,7 @@ def responses(client, model):
         raise ValueError("Responses did not complete the tool-result round trip")
 
 
-def run_checks(base_url, model, protocol="both", timeout=300):
+def run_checks(base_url, model, protocol="both", timeout=300, max_tokens=16000):
     client = Client(base_url, timeout)
     try:
         with client.request("/models") as response:
@@ -137,7 +137,7 @@ def run_checks(base_url, model, protocol="both", timeout=300):
         if protocol not in ("both", name):
             continue
         try:
-            check(client, model)
+            check(client, model, max_tokens)
             print(f"PASS {name}: streaming tool-call/result round trip")
         except (OSError, ValueError, KeyError) as exc:
             harness = "Codex" if name == "responses" else "OpenCode"

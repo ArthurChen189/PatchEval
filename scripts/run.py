@@ -19,7 +19,8 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from scripts.infer.check_server import run_checks
-from scripts.infer.configure_harnesses import configure
+from scripts.infer.configure_harnesses import OPENCODE_VERSION, configure
+from scripts.infer.pass_at_k import aggregate
 
 
 def absolute(value):
@@ -47,10 +48,14 @@ def validate(cfg):
         raise ValueError("label must be <= 100 characters, start with a letter, digit, or underscore, and contain no path separators")
     for key in ("model.context_length", "model.output_tokens", "server.port", "server.tensor_parallel",
                 "server.data_parallel", "server.max_running_requests", "generation.concurrency",
-                "generation.timeout", "evaluation.max_workers"):
+                "generation.timeout", "generation.samples", "evaluation.max_workers"):
         positive(OmegaConf.select(cfg, key), key)
     if cfg.model.output_tokens >= cfg.model.context_length:
         raise ValueError("model.output_tokens must be smaller than model.context_length")
+    temperature = cfg.model.get("temperature")
+    if temperature is not None and (isinstance(temperature, bool) or not isinstance(temperature, (int, float))
+                                    or temperature < 0):
+        raise ValueError("model.temperature must be a non-negative number or null")
     if cfg.server.port > 65535 or not 0 < cfg.server.memory_fraction < 1:
         raise ValueError("Invalid server port or memory_fraction (must be between 0 and 1)")
     if not isinstance(cfg.generation.limit, int) or cfg.generation.limit == 0 or cfg.generation.limit < -1:
@@ -59,6 +64,9 @@ def validate(cfg):
         raise ValueError("Invalid check.protocol or check.timeout")
     if not OmegaConf.is_list(cfg.server.extra_args) or not all(isinstance(arg, str) for arg in cfg.server.extra_args):
         raise ValueError("server.extra_args must be a list of strings")
+    if any(arg.split("=", 1)[0] in {"--override-generation-config", "--generation-config"}
+           for arg in cfg.server.extra_args):
+        raise ValueError("Set model.output_tokens/model.temperature instead of generation-config extra_args")
 
 
 def bridge_host():
@@ -115,26 +123,90 @@ def serve_command(cfg):
             args.extend([flag, cfg.model[key]])
     if cfg.model.tool_call_parser:
         args.append("--enable-auto-tool-choice")
+    # max_new_tokens is a server-wide hard cap for Chat and Responses requests;
+    # temperature is the default for clients that do not send one (e.g. Codex).
+    generation = {"max_new_tokens": cfg.model.output_tokens}
+    if cfg.model.get("temperature") is not None:
+        generation["temperature"] = cfg.model.temperature
+    args.extend(["--override-generation-config", json.dumps(generation)])
     return args + list(cfg.server.extra_args)
 
 
-def find_run(cfg):
+SAMPLE_DIR = re.compile(r"sample_(\d+)")
+
+
+def completed(path):
+    return path.is_dir() and (path / "summary.json").is_file() and (path / "patches").is_dir()
+
+
+def configured_samples(generation):
+    resolved = generation.parent / "resolved.yaml"
+    if resolved.is_file():
+        return OmegaConf.load(resolved).get("generation", {}).get("samples")
+    return None
+
+
+def sample_runs(generation, allow_partial=False):
+    """Completed runs of a multi-sample generation directory, in sample order."""
+    done = []
+    for directory in sorted((d for d in generation.iterdir() if d.is_dir() and SAMPLE_DIR.fullmatch(d.name)),
+                            key=lambda d: int(SAMPLE_DIR.fullmatch(d.name).group(1))):
+        runs = [run for run in directory.iterdir() if completed(run)]
+        if len(runs) > 1:
+            raise ValueError(f"Expected one completed run in {directory}, found {len(runs)}")
+        done.extend(runs)
+    expected = configured_samples(generation)
+    if expected is None:
+        expected = max((int(SAMPLE_DIR.fullmatch(d.name).group(1)) + 1 for d in generation.iterdir()
+                        if d.is_dir() and SAMPLE_DIR.fullmatch(d.name)), default=0)
+    if len(done) != expected and not (allow_partial and done):
+        names = ", ".join(run.parent.name for run in done) or "none"
+        raise ValueError(
+            f"{len(done)} of {expected} configured samples completed in {generation} ({names}). "
+            f"Generate the missing samples with: bash temp_run_script.sh resume {generation.parent} "
+            f"(or generation.resume_dir={generation.parent}); set evaluation.allow_partial=true to "
+            "score only the completed samples.")
+    return done
+
+
+def find_runs(cfg):
+    """Generation run(s) to evaluate: one legacy run or every sample of one invocation."""
+    partial = bool(cfg.evaluation.get("allow_partial"))
     if cfg.evaluation.run_dir:
         path = absolute(cfg.evaluation.run_dir)
-        if not path.is_dir() or not (path / "patches").is_dir():
-            raise ValueError(f"Not a generation run directory: {path}")
-        return path
+        if path.is_dir() and (path / "patches").is_dir():
+            # A run inside generation/sample_<i>/ stands for its whole invocation.
+            if SAMPLE_DIR.fullmatch(path.parent.name):
+                return sample_runs(path.parent.parent, partial)
+            return [path]
+        if path.is_dir() and SAMPLE_DIR.fullmatch(path.name):
+            return sample_runs(path.parent, partial)
+        for generation in (path, path / "generation"):
+            if generation.is_dir() and any(SAMPLE_DIR.fullmatch(d.name) for d in generation.iterdir()):
+                return sample_runs(generation, partial)
+        raise ValueError(f"Not a generation run or multi-sample generation directory: {path}")
     root = absolute(cfg.paths.runs)
     patterns = [f"*-{cfg.label}", f"hydra/*/generation/*-{cfg.label}",
-                f"hydra/multirun/*/*/generation/*-{cfg.label}"]
-    matches = [p for pattern in patterns for p in root.glob(pattern)
-               if p.is_dir() and (p / "summary.json").is_file() and (p / "patches").is_dir()]
+                f"hydra/multirun/*/*/generation/*-{cfg.label}",
+                f"hydra/*/generation/sample_*/*-{cfg.label}",
+                f"hydra/multirun/*/*/generation/sample_*/*-{cfg.label}"]
+    matches = [p for pattern in patterns for p in root.glob(pattern) if completed(p)]
     if not matches:
         raise ValueError(f"No completed generation run for {cfg.label!r}; set evaluation.run_dir")
-    return max(matches, key=lambda path: (path.stat().st_mtime_ns, path.name))
+    newest = max(matches, key=lambda path: (path.stat().st_mtime_ns, path.name))
+    if SAMPLE_DIR.fullmatch(newest.parent.name):
+        return sample_runs(newest.parent.parent, partial)
+    return [newest]
 
 
-def generation_job(cfg, output):
+def find_run(cfg):
+    runs = find_runs(cfg)
+    if len(runs) != 1:
+        raise ValueError(f"Expected one generation run, found {len(runs)} samples")
+    return runs[0]
+
+
+def generation_job(cfg, output, harness_home=None):
     binary = str(cfg.harness.binary)
     if "/" in binary:
         binary = str(absolute(binary))
@@ -156,13 +228,15 @@ def generation_job(cfg, output):
     else:
         if cfg.harness.name == "traecli":
             raise ValueError("traecli requires harness.config pointing to an existing profile")
-        home = output / "harnesses"
+        home = harness_home or output / "harnesses"
         url = endpoint(cfg)
-        if not cfg.dry_run:
+        if not cfg.dry_run and harness_home is None:
             configure(home, url, cfg.model.served_name, cfg.model.context_length,
-                      output_tokens=cfg.model.output_tokens)
+                      output_tokens=cfg.model.output_tokens, temperature=cfg.model.get("temperature"))
         config = home / ("codex/local.config.toml" if cfg.harness.name == "codex"
                          else "opencode/config/opencode/opencode.json")
+        if harness_home is not None and not config.is_file():
+            raise ValueError(f"Resumed invocation has no rendered harness config: {config}")
     prefix = {"codex": "CODEX", "opencode": "OPENCODE", "traecli": "TRAE"}[cfg.harness.name]
     env = {f"{prefix}_BIN": binary, f"{prefix}_CONFIG": str(config),
            "DATASET": str(absolute(cfg.paths.dataset)), "OUTPUT_BASE": str(output / "generation"),
@@ -172,20 +246,88 @@ def generation_job(cfg, output):
     return ["bash", str(ROOT / "patcheval/exp_agent/run_infer.sh"), cfg.harness.name, cfg.label], env
 
 
+def record_harness_version(cfg, binary, output):
+    """Record the harness CLI version beside the resolved config.
+
+    Standalone Codex installs update themselves, so the executable behind a bare
+    `codex` can change between runs.
+    """
+    try:
+        text = subprocess.check_output([binary, "--version"], text=True, timeout=60,
+                                       stderr=subprocess.STDOUT).strip()
+    except (OSError, subprocess.SubprocessError):
+        text = ""
+    version = (re.search(r"\d+\.\d+\.\d+", text) or [None])[0]
+    record = {"harness": cfg.harness.name, "binary": str(Path(binary).resolve()), "version": version,
+              "version_output": text}
+    if cfg.harness.name == "opencode" and not cfg.harness.config:
+        record["opencode_version_validated"] = OPENCODE_VERSION
+        if version != OPENCODE_VERSION:
+            print(f"WARNING: rendered OpenCode settings were validated with {OPENCODE_VERSION}, "
+                  f"but {binary} reports {version or 'an unknown version'}", file=sys.stderr)
+    (output / "harness-version.json").write_text(json.dumps(record, indent=2) + "\n")
+    return record
+
+
+def prepare_resume(cfg, output):
+    """Adopt a previous generation invocation's settings and list its missing samples."""
+    target = absolute(cfg.generation.resume_dir)
+    stored_file = target / "resolved.yaml"
+    if not stored_file.is_file():
+        raise ValueError(f"Not a generation invocation (no resolved.yaml): {target}")
+    stored = OmegaConf.load(stored_file)
+    if stored.get("action") != "generate":
+        raise ValueError(f"{target} is not a generation invocation")
+    # Every setting that shapes a sample comes from the original invocation, so
+    # resumed samples are drawn under identical conditions.
+    for key in ("model", "harness", "label"):
+        OmegaConf.update(cfg, key, stored[key], merge=False)
+    for key in ("limit", "concurrency", "timeout", "samples", "save_trajectories"):
+        OmegaConf.update(cfg, f"generation.{key}", stored.generation[key])
+    for key in ("host", "port", "base_url"):
+        OmegaConf.update(cfg, f"server.{key}", stored.server[key])
+    cfg.paths.dataset = stored.paths.dataset
+    validate(cfg)
+    harness_home = None if cfg.harness.config else target / "harnesses"
+    samples = cfg.generation.samples
+    bases = [target / "generation" / (f"sample_{i}" if samples > 1 else "") for i in range(samples)]
+    pending = [i for i, base in enumerate(bases)
+               if not (base.is_dir() and any(completed(run) for run in base.iterdir()))]
+    print(f"Resuming {target}: samples {pending or 'none'} of {samples} still to generate", flush=True)
+    return target, harness_home, pending
+
+
+def check_resume_version(target, record):
+    stored = target / "harness-version.json"
+    if stored.is_file():
+        previous = json.loads(stored.read_text()).get("version")
+        if previous and record["version"] != previous:
+            raise ValueError(f"Harness version changed since {target} was generated "
+                             f"({previous} -> {record['version']}); set harness.binary to the "
+                             "original release to keep samples comparable")
+
+
 def evaluation_jobs(cfg, output):
-    run = find_run(cfg)
+    """Conversion and evaluation commands for each sample; one sample keeps the flat layout."""
+    runs = find_runs(cfg)
     evaluator = ROOT / "patcheval/evaluation"
-    patch_input = output / "eval_inputs/patches.jsonl"
-    # The evaluator prefixes its output argument with ./evaluation_output/.
-    relative_output = os.path.relpath(output / "evaluation_output", evaluator / "evaluation_output")
-    convert = [sys.executable, str(ROOT / "patcheval/exp_agent/process_data.py"),
-               "--runner-output", str(run), "--process-data-path", str(patch_input),
-               "--test-data-path", str(absolute(cfg.paths.dataset))]
-    evaluate = [sys.executable, str(evaluator / "run_evaluation.py"),
-                "--output", relative_output, "--patch_file", str(patch_input),
-                "--input_file", str(absolute(cfg.paths.dataset)),
-                "--max_workers", str(cfg.evaluation.max_workers), "--log_level", cfg.evaluation.log_level]
-    return run, [(convert, ROOT), (evaluate, evaluator)]
+    jobs, results = [], []
+    for run in runs:
+        suffix = run.parent.name if SAMPLE_DIR.fullmatch(run.parent.name) else ""
+        patch_input = output / "eval_inputs" / suffix / "patches.jsonl"
+        report = output / "evaluation_output" / suffix
+        # The evaluator prefixes its output argument with ./evaluation_output/.
+        relative_output = os.path.relpath(report, evaluator / "evaluation_output")
+        jobs.append(([sys.executable, str(ROOT / "patcheval/exp_agent/process_data.py"),
+                      "--runner-output", str(run), "--process-data-path", str(patch_input),
+                      "--test-data-path", str(absolute(cfg.paths.dataset))], ROOT))
+        jobs.append(([sys.executable, str(evaluator / "run_evaluation.py"),
+                      "--output", relative_output, "--patch_file", str(patch_input),
+                      "--input_file", str(absolute(cfg.paths.dataset)),
+                      "--max_workers", str(cfg.evaluation.max_workers),
+                      "--log_level", cfg.evaluation.log_level], evaluator))
+        results.append((patch_input, report / "summary.json"))
+    return runs, jobs, results
 
 
 def save_config(cfg, output):
@@ -243,7 +385,8 @@ def dispatch(cfg, output):
             print(f"Would render harness configs in {absolute(cfg.configure.output_dir)} for {url}")
             return
         home = configure(absolute(cfg.configure.output_dir), url, cfg.model.served_name,
-                         cfg.model.context_length, cfg.configure.force, cfg.model.output_tokens)
+                         cfg.model.context_length, cfg.configure.force, cfg.model.output_tokens,
+                         cfg.model.get("temperature"))
         print(f"Generated Codex and OpenCode configs in {home}")
         print("action=generate renders fresh local configs automatically unless harness.config is set.")
     elif cfg.action == "check":
@@ -252,7 +395,7 @@ def dispatch(cfg, output):
         if cfg.dry_run:
             print(f"Would check {url}: model={cfg.model.served_name}, protocol={cfg.check.protocol}")
             return
-        if run_checks(url, cfg.model.served_name, cfg.check.protocol, cfg.check.timeout):
+        if run_checks(url, cfg.model.served_name, cfg.check.protocol, cfg.check.timeout, cfg.model.output_tokens):
             raise SystemExit(1)
     elif cfg.action == "analyze":
         from scripts.infer.analyze_trajectories import analyze
@@ -266,16 +409,64 @@ def dispatch(cfg, output):
         summary = analyze(absolute(cfg.analysis.input_dir), destination)
         print(f"Normalized {summary['completed_tasks']} tasks: {destination}")
     elif cfg.action == "evaluate":
-        run, jobs = evaluation_jobs(cfg, output)
-        cfg.evaluation.run_dir = str(run)
+        runs, jobs, results = evaluation_jobs(cfg, output)
+        sampled = bool(SAMPLE_DIR.fullmatch(runs[0].parent.name))
+        cfg.evaluation.run_dir = str(runs[0].parent.parent if sampled else runs[0])
         save_config(cfg, output)
         for command, cwd in jobs:
             run_command(command, {}, cfg, cwd=cwd)
         print(f"Evaluation output: {output / 'evaluation_output'}")
+        if not cfg.dry_run:
+            expected = configured_samples(runs[0].parent.parent) if sampled else 1
+            summary = aggregate(results, output / "pass_at_k.json", {
+                "sample_runs": [str(run) for run in runs],
+                "configured_samples": expected or len(runs),
+                "partial": bool(expected) and len(runs) < expected})
+            scores = "  ".join(f"pass@{k}={summary[f'pass@{k}']:.2%}" for k in range(1, summary["n_samples"] + 1))
+            note = f" (PARTIAL: {len(runs)} of {expected} samples)" if summary["partial"] else ""
+            print(f"{summary['n_cves']} CVEs x {summary['n_samples']} samples: {scores}{note}")
+            print(f"pass@k summary: {output / 'pass_at_k.json'}")
     else:
-        command, env = generation_job(cfg, output)
+        target, harness_home, pending = output, None, None
+        if cfg.generation.get("resume_dir"):
+            target, harness_home, pending = prepare_resume(cfg, output)
+        command, env = generation_job(cfg, output, harness_home)
         save_config(cfg, output)
-        run_command(command, env, cfg)
+        prefix = {"codex": "CODEX", "opencode": "OPENCODE", "traecli": "TRAE"}[cfg.harness.name]
+        if not cfg.dry_run:
+            record = record_harness_version(cfg, env[f"{prefix}_BIN"], output)
+            if harness_home is not None:
+                check_resume_version(target, record)
+        # Independent samples for pass@k run one after another against the same
+        # server and harness config, each in its own generation/sample_<i>/.
+        samples = cfg.generation.samples
+        incomplete = []
+        for index in (pending if pending is not None else range(samples)):
+            base = target / "generation" / (f"sample_{index}" if samples > 1 else "")
+            sample_env = {**env, "OUTPUT_BASE": str(base)}
+            if samples > 1:
+                print(f"Generation sample {index + 1}/{samples}", flush=True)
+            before = {run for run in base.iterdir() if completed(run)} if base.is_dir() else set()
+            try:
+                run_command(command, sample_env, cfg)
+            except subprocess.CalledProcessError as exc:
+                # The runner exits 1 when any task fails; a finished run with failed
+                # repairs is still a complete sample and is evaluated as such.
+                finished = [run for run in base.iterdir() if completed(run)] if base.is_dir() else []
+                if not set(finished) - before:
+                    incomplete.append(index)
+                    print(f"Sample {index} did not complete (runner exit {exc.returncode})",
+                          file=sys.stderr, flush=True)
+                else:
+                    print(f"Sample {index} completed with failed tasks (runner exit {exc.returncode}); "
+                          "continuing", flush=True)
+        if harness_home is not None and not cfg.dry_run:
+            with (target / "resumed_by.jsonl").open("a", encoding="utf-8") as log:
+                log.write(json.dumps({"invocation": str(output), "samples": list(pending),
+                                      "incomplete": incomplete}) + "\n")
+        if incomplete:
+            raise ValueError(f"Samples {incomplete} did not complete; rerun with "
+                             f"generation.resume_dir={target}")
 
 
 @hydra.main(version_base="1.3", config_path=str(ROOT / "scripts/conf"), config_name="config")

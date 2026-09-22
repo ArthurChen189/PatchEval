@@ -6,7 +6,15 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 
-def configure(output, base_url, model, context, force=False, output_tokens=8192):
+# Agent and model settings are validated against this OpenCode release.
+OPENCODE_VERSION = "1.18.31"
+# Built-in agents of OpenCode 1.18.31 (`opencode agent list`, src/agent/agent.ts).
+# Newer docs also list `scout`, which this release lacks; unknown names would
+# define new custom agents, so only these receive a temperature.
+OPENCODE_AGENTS = ("build", "plan", "general", "explore", "compaction", "summary", "title")
+
+
+def configure(output, base_url, model, context, force=False, output_tokens=16000, temperature=None):
     parsed = urlparse(base_url)
     if parsed.scheme not in ("http", "https") or not parsed.hostname:
         raise ValueError("base URL must be an HTTP(S) URL")
@@ -16,6 +24,9 @@ def configure(output, base_url, model, context, force=False, output_tokens=8192)
         raise ValueError("base URL must end in /v1")
     if not model.strip() or context < 16384 or not 0 < output_tokens < context:
         raise ValueError("model must be nonempty, context >= 16384, and 0 < output_tokens < context")
+    if temperature is not None and (isinstance(temperature, bool) or not isinstance(temperature, (int, float))
+                                    or temperature < 0):
+        raise ValueError("temperature must be a non-negative number or None")
     output = Path(output).expanduser().resolve()
     base_url = base_url.rstrip("/")
     quote = json.dumps  # Basic TOML strings share JSON escaping for these values.
@@ -45,6 +56,14 @@ supports_websockets = false
                                "limit": {"context": context, "output": output_tokens}}},
         }},
     }
+    # Codex has no output-cap or temperature config key; vLLM enforces both.
+    # OpenCode sends agent.<name>.temperature (https://opencode.ai/docs/agents/#temperature)
+    # only when the model declares temperature support; custom models default to
+    # false in 1.18.31, which would silently drop it. The built-in title agent
+    # otherwise uses 0.5.
+    if temperature is not None:
+        opencode["provider"]["vllm"]["models"][model]["temperature"] = True
+        opencode["agent"] = {name: {"temperature": temperature} for name in OPENCODE_AGENTS}
     files = {
         output / "codex/config.toml": config,
         output / "codex/local.config.toml": config,
@@ -52,6 +71,12 @@ supports_websockets = false
         output / "config-manifest.json": json.dumps({
             "model": model, "base_url": base_url, "context_length": context,
             "codex_protocol": "responses", "opencode_protocol": "chat/completions",
+            "output_tokens": output_tokens, "temperature": temperature,
+            "opencode_version_validated": OPENCODE_VERSION,
+            "enforcement": {
+                "codex": "vLLM --override-generation-config (max_new_tokens, default temperature)",
+                "opencode": "limit.output and agent.*.temperature; vLLM max_new_tokens also caps",
+            },
         }, indent=2) + "\n",
     }
     existing = [str(path) for path in files if path.exists()]
