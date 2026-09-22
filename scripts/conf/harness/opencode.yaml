@@ -1,7 +1,9 @@
 name: opencode
 # Pinned OpenCode, vendored under third_party/opencode/<version>/ and extracted
-# from its .xz archive (checksum-verified) on first use. OPENCODE_BIN overrides it -- this ensure that we use the same version of the opencode across all evaluation runs.
-binary: ${repo:}/third_party/opencode/1.18.31/opencode-linux-x64
+# from its .xz archive (checksum-verified) on first use. OPENCODE_BIN overrides it;
+# keep the default so every evaluation run uses the same OpenCode release.
+binary: ${oc.env:OPENCODE_BIN,${repo:}/third_party/opencode/1.18.31/opencode-linux-x64}
 # Generation refuses a binary that reports another version; null disables the check.
+# Keep in sync with OPENCODE_PINNED_VERSION in patcheval/exp_agent/agents/opencode.sh.
 version: 1.18.31
 config: null

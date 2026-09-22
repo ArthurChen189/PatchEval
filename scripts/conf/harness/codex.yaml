@@ -1,8 +1,10 @@
 name: codex
 # Pinned Codex CLI, vendored under third_party/codex/<version>/ and extracted from
-# its .xz archive (checksum-verified) on first use.
-binary: ${repo:}/third_party/codex/0.155.0/codex-x86_64-unknown-linux-musl
+# its .xz archive (checksum-verified) on first use. CODEX_BIN overrides it; keep
+# the default so every evaluation run uses the same Codex release.
+binary: ${oc.env:CODEX_BIN,${repo:}/third_party/codex/0.155.0/codex-x86_64-unknown-linux-musl}
 # Generation refuses a binary that reports another version; null disables the check.
+# Keep in sync with CODEX_PINNED_VERSION in patcheval/exp_agent/agents/codex.sh.
 version: 0.155.0
 # null renders a fresh local-model config for each generation invocation.
 config: null

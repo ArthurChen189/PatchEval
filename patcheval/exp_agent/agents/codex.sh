@@ -1,17 +1,24 @@
 # Codex CLI agent adapter. Source this file from run_infer.sh.
 #
 # Required:
-#   CODEX_BIN=/path/to/codex
 #   CODEX_CONFIG=/path/to/codex-home/<profile>.config.toml
+# Optional:
+#   CODEX_BIN=/path/to/codex (default: the vendored pinned release)
+#   CODEX_VERSION=<x.y.z>   (default: CODEX_PINNED_VERSION; empty skips the check)
 #
 # CODEX_CONFIG is the single profile/config input. The adapter derives:
 #   CODEX_HOME_SRC = dirname(CODEX_CONFIG)
 #   CODEX_PROFILE  = basename(CODEX_CONFIG) without .config.toml
 
-: "${CODEX_BIN:?Set CODEX_BIN to the Codex executable, e.g. /path/to/bin/codex}"
+# Keep in sync with scripts/conf/harness/codex.yaml.
+CODEX_PINNED_VERSION=0.155.0
+CODEX_VENDORED_BIN=third_party/codex/0.155.0/codex-x86_64-unknown-linux-musl
+# shellcheck source=../pinned_harness.sh
+source "$(dirname "${BASH_SOURCE[0]}")/../pinned_harness.sh"
+
 : "${CODEX_CONFIG:?Set CODEX_CONFIG to a Codex profile config file, e.g. /path/to/codex-home/gpt54-gggso.config.toml}"
 
-CODEX_BIN="$(realpath "$CODEX_BIN")"
+pinned_harness_resolve CODEX_BIN "$CODEX_VENDORED_BIN"
 if [[ ! -x "$CODEX_BIN" ]]; then
   echo "CODEX_BIN does not exist or is not executable: $CODEX_BIN" >&2
   exit 1
@@ -44,6 +51,7 @@ if [[ "$(basename "$CODEX_BIN")" == "codex.js" ]]; then
   fi
   CODEX_BIN="$(realpath "$resolved_native")"
 fi
+pinned_harness_check CODEX_BIN "$CODEX_PINNED_VERSION"
 CODEX_CONFIG="$(realpath "$CODEX_CONFIG")"
 if [[ ! -f "$CODEX_CONFIG" ]]; then
   echo "CODEX_CONFIG does not exist or is not a file: $CODEX_CONFIG" >&2

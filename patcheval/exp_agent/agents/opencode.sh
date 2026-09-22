@@ -1,24 +1,32 @@
 # OpenCode agent adapter. Source this file from run_infer.sh.
 #
 # Required:
-#   OPENCODE_BIN=/path/to/opencode
 #   OPENCODE_CONFIG=/path/to/opencode-home/config/opencode/opencode.json
+# Optional:
+#   OPENCODE_BIN=/path/to/opencode (default: the vendored pinned release)
+#   OPENCODE_VERSION=<x.y.z>      (default: OPENCODE_PINNED_VERSION; empty skips the check)
 #
 # OPENCODE_CONFIG is the single config input. The adapter derives the XDG config
 # and data roots from it. Config is mounted read-only; data is mounted read-only
 # as a seed and copied to /tmp inside each case container so concurrent runs do
 # not write to the same host state/log files.
 
-: "${OPENCODE_BIN:?Set OPENCODE_BIN to the OpenCode executable, e.g. /path/to/bin/opencode}"
+# Keep in sync with scripts/conf/harness/opencode.yaml.
+OPENCODE_PINNED_VERSION=1.18.31
+OPENCODE_VENDORED_BIN=third_party/opencode/1.18.31/opencode-linux-x64
+# shellcheck source=../pinned_harness.sh
+source "$(dirname "${BASH_SOURCE[0]}")/../pinned_harness.sh"
+
 : "${OPENCODE_CONFIG:?Set OPENCODE_CONFIG to opencode.json, e.g. /path/to/opencode-home/config/opencode/opencode.json}"
 
 AGENT_MOUNTS=()
 AGENT_EXTRA_ARGS=()
-OPENCODE_BIN="$(realpath "$OPENCODE_BIN")"
+pinned_harness_resolve OPENCODE_BIN "$OPENCODE_VENDORED_BIN"
 if [[ ! -x "$OPENCODE_BIN" ]]; then
   echo "OPENCODE_BIN does not exist or is not executable: $OPENCODE_BIN" >&2
   exit 1
 fi
+pinned_harness_check OPENCODE_BIN "$OPENCODE_PINNED_VERSION"
 OPENCODE_CONFIG="$(realpath "$OPENCODE_CONFIG")"
 if [[ ! -f "$OPENCODE_CONFIG" ]]; then
   echo "OPENCODE_CONFIG does not exist or is not a file: $OPENCODE_CONFIG" >&2

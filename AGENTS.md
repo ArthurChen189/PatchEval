@@ -376,9 +376,15 @@ extracted executable beside each archive and set `harness.version`. Generation
 extracts a missing executable on first use, verifies both checksums, and keeps
 it git-ignored; it then refuses any binary whose `--version` differs from
 `harness.version` (the hosts' standalone installs update themselves, e.g. Codex
-to 0.156.0). `CODEX_BIN`/`OPENCODE_BIN` or `harness.binary` still select another
+to 0.156.0). An extracted vendored binary is checksum-verified on every run.
+`CODEX_BIN`/`OPENCODE_BIN` or `harness.binary` still select another
 executable, which also requires overriding `harness.version` (or `null` to skip
-the check). Each generation records the CLI version in `harness-version.json`
+the check). The legacy `run_infer.sh` adapters enforce the same pins through
+`patcheval/exp_agent/pinned_harness.sh`: with `CODEX_BIN`/`OPENCODE_BIN` unset
+they use the vendored binary, and before any case starts they require
+`--version` to match `CODEX_VERSION`/`OPENCODE_VERSION` (default: the pin in
+`agents/<harness>.sh`, kept equal to the YAML by `tests/test_pinned_harness.py`;
+empty skips the check). Hydra passes `harness.version` through to them. Each generation records the CLI version in `harness-version.json`
 beside `resolved.yaml`; with `harness.version=null`, a rendered OpenCode config
 used with a release other than 1.18.31 only warns. To sweep generation settings, use Hydra `--multirun`, e.g.
 `bash scripts/run.sh --multirun action=generate experiment=smoke harness=codex,opencode`.

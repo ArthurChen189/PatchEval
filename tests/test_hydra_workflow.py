@@ -242,6 +242,8 @@ class HydraWorkflowTests(unittest.TestCase):
             self.assertEqual(disabled_env['SAVE_TRAJECTORIES'], 'false')
             self.assertEqual(kwargs['env']['OUTPUT_BASE'], str(Path(tmp) / 'single job/generation'))
             self.assertTrue(Path(kwargs['env']['OPENCODE_CONFIG']).is_file())
+            # The adapter re-checks the same pin as record_harness_version.
+            self.assertEqual(kwargs['env']['OPENCODE_VERSION'], '1.18.31')
             self.assertEqual(kwargs['cwd'], ROOT)
             record = json.loads((Path(tmp) / 'single job/harness-version.json').read_text())
             self.assertEqual((record['harness'], record['opencode_version_validated']), ('opencode', '1.18.31'))
@@ -283,6 +285,10 @@ class HydraWorkflowTests(unittest.TestCase):
                 workflow.ensure_vendored_binary(binary)
             self.assertEqual(binary.read_bytes(), data)
             self.assertTrue(os.access(binary, os.X_OK))
+            # An already-extracted binary is re-verified on every run.
+            binary.write_bytes(b'#!/bin/sh\necho tool 1.0.0 replaced\n')
+            with self.assertRaisesRegex(ValueError, 'Checksum mismatch'):
+                workflow.ensure_vendored_binary(binary)
             binary.unlink()
             (Path(tmp) / 'tool.xz').write_bytes(lzma.compress(b'tampered'))
             with self.assertRaisesRegex(ValueError, 'Checksum mismatch'):

@@ -199,7 +199,7 @@ Start with one case before scaling to the complete dataset.
 conda activate patcheval
 cd patcheval/exp_agent
 
-export CODEX_BIN=/path/to/codex
+# CODEX_BIN defaults to the pinned vendored Codex 0.155.0 under third_party/.
 export CODEX_CONFIG=/path/to/codex-home/<profile>.config.toml
 
 LIMIT=1 CONCURRENCY=1 bash run_infer.sh codex codex_smoke

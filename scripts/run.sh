@@ -15,11 +15,11 @@
 # 🧪  Generate Patches for Smoke Test:
 #   # Codex
 #   bash scripts/run.sh action=generate experiment=smoke harness=codex \
-#     label=qwen_codex_smoke harness.binary="$(command -v codex)"
+#     label=qwen_codex_smoke   # pinned vendored Codex 0.155.0 by default
 #
 #   # OpenCode
 #   bash scripts/run.sh action=generate experiment=smoke harness=opencode \
-#     label=qwen_opencode_smoke harness.binary=/absolute/path/to/opencode
+#     label=qwen_opencode_smoke   # pinned vendored OpenCode 1.18.31 by default
 #
 # 🌐  Use non-default endpoint: 
 #     append server.base_url=http://HOST:30000/v1

@@ -21,7 +21,7 @@ Run one smoke case with Codex, then evaluate the generated patch:
 conda activate patcheval
 cd patcheval/exp_agent
 
-export CODEX_BIN=/path/to/bin/codex
+# CODEX_BIN defaults to the pinned vendored Codex 0.155.0 under third_party/.
 export CODEX_CONFIG=/path/to/codex-home/my-profile.config.toml
 
 LIMIT=1 CONCURRENCY=1 bash run_infer.sh codex codex_smoke
@@ -36,7 +36,7 @@ the agent name:
 conda activate patcheval
 cd patcheval/exp_agent
 
-export OPENCODE_BIN=/path/to/bin/opencode
+# OPENCODE_BIN defaults to the pinned vendored OpenCode 1.18.31 under third_party/.
 export OPENCODE_CONFIG=/path/to/opencode-home/config/opencode/opencode.json
 LIMIT=1 CONCURRENCY=1 bash run_infer.sh opencode opencode_smoke
 bash run_eval.sh opencode_smoke
@@ -116,12 +116,14 @@ export LIMIT=-1                  # -1 means all selected cases
 
 ### Codex
 
-Required environment variables:
+Required environment variable:
 
 ```bash
-export CODEX_BIN=/path/to/bin/codex
 export CODEX_CONFIG=/path/to/codex-home/my-profile.config.toml
 ```
+
+`CODEX_BIN` is optional and defaults to the pinned vendored release (see
+[Pinned harness binaries](#pinned-harness-binaries)).
 
 Run:
 
@@ -137,12 +139,14 @@ codex exec --profile <profile> ... -C {workdir} < {prompt_file}
 
 ### OpenCode
 
-Required environment variables:
+Required environment variable:
 
 ```bash
-export OPENCODE_BIN=/path/to/bin/opencode
 export OPENCODE_CONFIG=/path/to/opencode-home/config/opencode/opencode.json
 ```
+
+`OPENCODE_BIN` is optional and defaults to the pinned vendored release (see
+[Pinned harness binaries](#pinned-harness-binaries)).
 
 Run:
 
@@ -156,13 +160,6 @@ container before running:
 
 ```text
 opencode run --format json --auto < {prompt_file}
-```
-
-Example:
-
-```bash
-export OPENCODE_BIN=/path/to/opencode-runtime/bin/opencode
-export OPENCODE_CONFIG=/path/to/opencode-home/config/opencode/opencode.json
 ```
 
 ### TraeCLI / TraeX
@@ -296,14 +293,24 @@ agent_runs/<timestamp>-<prefix>/
   empty patch files and are counted as failed repairs during evaluation.
 - Keep credentials and runtime homes outside version control.
 
-OpenCode executable discovery checks `PATH` first, then `~/.opencode/bin/opencode`
-when the configured executable is the default `opencode`. This supports zsh and
-noninteractive Bash without sourcing `.bashrc`. An explicit `OPENCODE_BIN` or
-`harness.binary` path takes precedence; invalid explicit paths fail rather than
-silently selecting a different installation. For the temporary helper:
+### Pinned harness binaries
+
+For comparable results, every generation path defaults to the same vendored
+releases: Codex 0.155.0 and OpenCode 1.18.31 under `third_party/` (xz archives
+with `SHA256SUMS`). The Hydra harness YAMLs and the `run_infer.sh` adapters
+share these pins. On first use the executable is extracted beside its archive
+(git-ignored); an extracted vendored binary is checksum-verified on every run.
+Before any case container starts, the executable's `--version` must match the
+pin, so a self-updating host install cannot silently change the agent.
+
+`CODEX_BIN`/`OPENCODE_BIN` (or Hydra `harness.binary`) select another
+executable. A different release also needs `CODEX_VERSION`/`OPENCODE_VERSION`
+(Hydra: `harness.version`) set to its version; an empty value skips the check
+and prints a warning. Each Hydra generation records the version it used in
+`harness-version.json`.
 
 ```bash
 HARNESS=opencode bash temp_run_script.sh smoke
-# Optional explicit executable override:
+# Explicit executable override (must still report the pinned version):
 OPENCODE_BIN="$HOME/.opencode/bin/opencode" HARNESS=opencode bash temp_run_script.sh smoke
 ```

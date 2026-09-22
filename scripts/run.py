@@ -263,9 +263,13 @@ def find_run(cfg):
 
 
 def ensure_vendored_binary(path):
-    """Extract a vendored `<binary>.xz` next to itself, verifying SHA256SUMS."""
+    """Extract a vendored `<binary>.xz` next to itself, verifying SHA256SUMS.
+
+    An already-extracted binary is re-verified on every run, so a replaced or
+    corrupted executable cannot stand in for the pinned release.
+    """
     archive = path.with_name(path.name + ".xz")
-    if path.exists() or not archive.is_file():
+    if not archive.is_file():
         return
     sums = {}
     for line in (path.parent / "SHA256SUMS").read_text().splitlines():
@@ -273,6 +277,10 @@ def ensure_vendored_binary(path):
         sums[name] = digest
     def digest(data):
         return hashlib.sha256(data).hexdigest()
+    if path.exists():
+        if digest(path.read_bytes()) != sums.get(path.name):
+            raise ValueError(f"Checksum mismatch for {path}; delete it to re-extract {archive.name}")
+        return
     packed = archive.read_bytes()
     if digest(packed) != sums.get(archive.name):
         raise ValueError(f"Checksum mismatch for {archive}")
@@ -320,7 +328,10 @@ def generation_job(cfg, output, harness_home=None):
         if harness_home is not None and not config.is_file():
             raise ValueError(f"Resumed invocation has no rendered harness config: {config}")
     prefix = {"codex": "CODEX", "opencode": "OPENCODE", "traecli": "TRAE"}[cfg.harness.name]
+    # The adapter re-checks the binary against the same pin (empty skips it).
+    version = cfg.harness.get("version")
     env = {f"{prefix}_BIN": binary, f"{prefix}_CONFIG": str(config),
+           f"{prefix}_VERSION": "" if version is None else str(version),
            "DATASET": str(absolute(cfg.paths.dataset)), "OUTPUT_BASE": str(output / "generation"),
            "LIMIT": str(cfg.generation.limit), "CONCURRENCY": str(cfg.generation.concurrency),
            "AGENT_TIMEOUT": str(cfg.generation.timeout),
