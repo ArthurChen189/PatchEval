@@ -80,21 +80,31 @@ when the CLI is launched from another directory. The entrypoint anchors executio
 Hydra itself does not change directories. Explicit relative `hydra.run.dir` and
 `hydra.sweep.dir` overrides therefore also resolve from the repository root. `paths.runs` defaults to `patcheval/exp_agent/agent_runs/`.
 Each invocation records its config and overrides in
-`paths.runs/hydra/<timestamp>-<name>/.hydra/` and its resolved settings in
-`resolved.yaml`. The `run_name` resolver in `scripts/run.py` names the folder
-after its work: `generate-<harness>-<label>`, `resume-<resumed folder>`,
-`evaluate-<scored generation folder>` (or `evaluate-<label>`), `check-<harness>`,
-`configure-<harness>`, `analyze-<harness>`, `serve`, `setup`.
-`temp_run_script.sh smoke|full` names its generation invocation
-`gen-<harness>-<experiment>-<UTC time>-XXXXXXXX`. Kept runs in this checkout were
-renamed on 2026-09-23 to `gen-`/`eval-`/`serve-<harness>-<experiment>-<server>-<samples>-<date>`
-(server tags `v1-8kcap`, `oldserver16k`, `mtp16k`), with references inside runs
-and `analysis_reports/` rewritten; `hydra/INDEX.md` describes each folder and
-`hydra/RENAMES.tsv` maps the old names. Redundant invocations are staged in
-`paths.runs/_to_delete/` (outside `hydra/`, so label lookup ignores them) with a
+`paths.runs/<group>/<timestamp>-<name>/.hydra/` and its resolved settings in
+`resolved.yaml`. Results are grouped by what was evaluated (`run_group` resolver
+in `scripts/run.py`): `<group>` is `<model>_<Harness>_Max-output-token=<cap>`, e.g.
+`Qwen3.8-27B_Codex_Max-output-token=16k` (model = basename of `model.served_name`,
+cap from `model.output_tokens`: 16000 -> `16k`, 8192 -> `8k`), holding that
+combination's generations, checks, evaluations, resumes, and merged pass@k reports.
+Evaluations and resumes join the group of the run they act on (its folder under
+`paths.runs`, or else the group recorded in its `resolved.yaml`), whatever
+`harness` says; `serve`/`setup` go to `<model>_vLLM-serving/`. Cross-harness
+comparisons are kept in `<model>_<A>-vs-<B>_Max-output-token=<cap>/`. The `run_name`
+resolver names the folder after its work: `generate-<harness>-<label>`,
+`resume-<resumed folder>`, `evaluate-<scored generation folder>` (or
+`evaluate-<label>`), `check-<harness>`, `configure-<harness>`, `analyze-<harness>`,
+`serve`, `setup`. `temp_run_script.sh smoke|full` lets Hydra choose that directory
+and evaluates the run by its unique label. Hydra's override grammar rejects an
+unquoted `=` inside a value, so `scripts/run.py` quotes `key=value` arguments whose
+value contains `=` (not lists, dicts, or already-quoted values) before Hydra parses
+them; `evaluation.run_dir=.../Max-output-token=16k/...` works unquoted.
+Existing runs were regrouped on 2026-09-23 (earlier `hydra/` layout; label lookup
+still finds legacy `hydra/` runs). `paths.runs/INDEX.md` describes each folder and
+`paths.runs/RENAMES.tsv` maps every original name to its current location.
+Redundant invocations are staged in `paths.runs/_to_delete/` with a
 `DELETE_LIST.md` of reasons. Generation writes its run beneath that invocation's
 `generation/` directory, keeping sweep jobs isolated. `--multirun` uses
-`paths.runs/hydra/multirun/`. Resolved snapshots may contain values obtained
+`paths.runs/multirun/`. Resolved snapshots may contain values obtained
 from environment interpolations, so keep credentials out of config files and
 CLI overrides. Logs stay with their invocation. Serving environments and model
 caches remain separate: `paths.runtime` defaults to `~/.cache/patcheval/local_llm`
@@ -338,7 +348,18 @@ minutes, since that run is probably still generating. Each sample is converted a
 using the unbiased estimator 1 - C(n-c,k)/C(n,k); pass@1 is the mean
 single-sample solve rate over all samples, and pass@4 with four samples is the
 fraction of cases solved at least once. Per-sample solve counts and evaluator
-execution errors are included for inspection. To pool samples from several
+execution errors are included for inspection. Each pass@k (overall and per language) also has an
+`uncertainty` block: `stderr`, `variance`, and `ci95` over CVEs of the per-CVE
+unbiased estimates (normal 95% CI, clipped to [0, 1]), and run-to-run spread
+`run_values`/`run_variance`/`run_std`/`run_min`/`run_max` from pass@k of every
+size-k subset of the sample runs (pass@1: each run; pass@n: one subset, variance
+null). `per_cve_solved_samples` and `per_cve_language` are stored for later
+comparisons. `python -m scripts.infer.pass_at_k --compare A/pass_at_k.json
+B/pass_at_k.json --labels a,b --out DIR` writes `comparison.json`, `comparison.md`
+and `error_bars.svg`: paired B - A differences over the same CVEs with SE, 95% CI,
+a two-sided sign-flip permutation p-value (headline; 20,000 draws, seed 0) and a
+normal-approximation p-value, overall and per language. At high k the per-CVE
+differences are mostly -1/0/+1, so prefer the permutation p. Standard library only. To pool samples from several
 evaluations (for example two runs of the same harness), use
 `python -m scripts.infer.pass_at_k --eval EVAL_DIR[:sample_0,sample_1] --eval ... --out NEW_DIR`;
 all samples must cover the same CVEs, and the report lists each sample's

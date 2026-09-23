@@ -11,6 +11,7 @@ import unittest
 from unittest.mock import patch
 
 from hydra import compose, initialize_config_dir
+from omegaconf import OmegaConf
 from scripts import run as workflow
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -71,9 +72,65 @@ class HydraWorkflowTests(unittest.TestCase):
             result = subprocess.run([sys.executable, str(ROOT / 'scripts/run.py'), 'action=check', 'dry_run=true',
                                      'harness=opencode', 'server.host=127.0.0.1', f'paths.runs={tmp}'],
                                     capture_output=True, text=True, check=True)
-            names = [p.name for p in (Path(tmp) / 'hydra').iterdir()]
+            cfg = config('harness=opencode')
+            group = workflow.group_name(cfg.model.served_name, 'opencode', cfg.model.output_tokens)
+            self.assertEqual([p.name for p in Path(tmp).iterdir()], [group], result.stdout)
+            names = [p.name for p in (Path(tmp) / group).iterdir()]
         self.assertEqual(len(names), 1, result.stdout)
         self.assertRegex(names[0], r'^\d{8}_\d{6}_\d{6}-check-opencode$')
+
+    def test_invocations_are_grouped_by_model_harness_and_output_cap(self):
+        self.assertEqual(workflow.cap_label(16000), '16k')
+        self.assertEqual(workflow.cap_label(8192), '8k')
+        self.assertEqual(workflow.cap_label(12345), '12345')
+        with tempfile.TemporaryDirectory() as tmp:
+            runs = Path(tmp)
+            group = workflow.run_group
+            codex = 'Qwen3.8-27B_Codex_Max-output-token=16k'
+            self.assertEqual(group(tmp, 'generate', 'Qwen/Qwen3.8-27B', 'codex', 16000), codex)
+            self.assertEqual(group(tmp, 'check', 'Qwen/Qwen3.5-9B', 'opencode', 8192),
+                             'Qwen3.5-9B_OpenCode_Max-output-token=8k')
+            self.assertEqual(group(tmp, 'serve', 'Qwen/Qwen3.8-27B', 'codex', 16000), 'Qwen3.8-27B_vLLM-serving')
+            # Evaluations and resumes join the scored run's group, whatever `harness` says.
+            invocation = runs / 'Qwen3.8-27B_OpenCode_Max-output-token=16k/stamp-generate'
+            (invocation / 'generation/sample_0/run').mkdir(parents=True)
+            (invocation / 'resolved.yaml').write_text('harness:\n  name: opencode\n')
+            sample = str(invocation / 'generation/sample_0/run')
+            self.assertEqual(group(tmp, 'evaluate', 'Qwen/Qwen3.8-27B', 'codex', 16000, sample),
+                             invocation.parent.name)
+            self.assertEqual(group(tmp, 'generate', 'Qwen/Qwen3.8-27B', 'codex', 16000, None, str(invocation)),
+                             invocation.parent.name)
+            self.assertEqual(workflow.run_name('evaluate', 'codex', 'l', sample), 'evaluate-stamp-generate')
+            # Legacy hydra/ runs: the group comes from the run's own resolved.yaml.
+            legacy = runs / 'hydra/old-run'
+            legacy.mkdir(parents=True)
+            OmegaConf.save(OmegaConf.create({'harness': {'name': 'opencode'},
+                                             'model': {'served_name': 'Qwen/Qwen3.5-9B', 'output_tokens': 8192}}),
+                           legacy / 'resolved.yaml')
+            self.assertEqual(group(tmp, 'evaluate', 'Qwen/Qwen3.8-27B', 'codex', 16000, str(legacy)),
+                             'Qwen3.5-9B_OpenCode_Max-output-token=8k')
+            # Label lookup finds runs inside group folders.
+            run = invocation / 'generation/sample_0/2026-grouped'
+            (run / 'patches').mkdir(parents=True)
+            (run / 'summary.json').write_text('{}')
+            (invocation / 'resolved.yaml').write_text('generation:\n  samples: 1\n')
+            cfg = config('action=evaluate', 'label=grouped')
+            cfg.paths.runs = tmp
+            self.assertEqual(workflow.find_runs(cfg), [run])
+
+    def test_values_containing_equals_are_quoted_for_hydra(self):
+        quote = workflow.quote_override
+        self.assertEqual(quote('evaluation.run_dir=/r/Qwen_Codex_Max-output-token=16k/gen'),
+                         'evaluation.run_dir="/r/Qwen_Codex_Max-output-token=16k/gen"')
+        self.assertEqual(quote('label=plain'), 'label=plain')
+        self.assertEqual(quote('server.extra_args=[--x=y]'), 'server.extra_args=[--x=y]')
+        self.assertEqual(quote("a='b=c'"), "a='b=c'")
+        self.assertEqual(quote('--cfg'), '--cfg')
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / 'Qwen3.8-27B_Codex_Max-output-token=16k'
+            result = subprocess.run([sys.executable, str(ROOT / 'scripts/run.py'), '--cfg', 'job',
+                                     f'evaluation.run_dir={run_dir}'], capture_output=True, text=True, check=True)
+        self.assertIn(f'run_dir: {run_dir}', result.stdout)
 
     def test_serving_command_preserves_literal_arguments(self):
         cfg = config('server.host=127.0.0.1', 'model.context_length=65536')

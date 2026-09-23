@@ -1,3 +1,8 @@
+import contextlib
+import io
+import math
+import statistics
+from xml.etree import ElementTree
 import json
 from pathlib import Path
 import tempfile
@@ -79,6 +84,72 @@ class MergeTests(unittest.TestCase):
             write_sample(evaluation / 'eval_inputs' / sample, {'CVE-A': 'Go', 'CVE-B': 'Go'}, set())
             write_sample(evaluation / 'evaluation_output' / sample, {'CVE-A': 'Go', 'CVE-B': 'Go'}, solved)
         return evaluation
+
+    def test_error_bars_over_cves_and_runs(self):
+        cases = {'CVE-A': 'Go', 'CVE-B': 'Go', 'CVE-C': 'Python'}
+        solved = [{'CVE-A'}, {'CVE-A', 'CVE-B'}, set(), {'CVE-A'}]
+        result = scoring.summarize([(cases, s, []) for s in solved])
+        errors = result['uncertainty']
+        # pass@1 per-CVE estimates 3/4, 1/4, 0 -> sample variance and SE over CVEs.
+        mean = 1 / 3
+        variance = ((0.75 - mean) ** 2 + (0.25 - mean) ** 2 + mean ** 2) / 2
+        self.assertAlmostEqual(errors['pass@1']['variance'], variance)
+        self.assertAlmostEqual(errors['pass@1']['stderr'], math.sqrt(variance / 3))
+        self.assertEqual(errors['pass@1']['ci95'][0], 0.0)  # clipped at 0
+        # Run-to-run: each sample's solve rate for pass@1, every pair for pass@2.
+        self.assertEqual(errors['pass@1']['run_values'], [1 / 3, 2 / 3, 0.0, 1 / 3])
+        self.assertAlmostEqual(errors['pass@1']['run_variance'], statistics.variance([1 / 3, 2 / 3, 0, 1 / 3]))
+        self.assertEqual(len(errors['pass@2']['run_values']), 6)
+        self.assertIsNone(errors['pass@4']['run_variance'])
+        for k in range(1, 5):
+            self.assertAlmostEqual(statistics.mean(errors[f'pass@{k}']['run_values']), result[f'pass@{k}'])
+        self.assertEqual(result['per_language']['Go']['uncertainty']['pass@1']['run_values'], [0.5, 1.0, 0.0, 0.5])
+        self.assertEqual(result['per_cve_solved_samples']['CVE-A'], [0, 1, 3])
+
+    def test_paired_comparison_p_values(self):
+        cves = [f'CVE-{i}' for i in range(60)]
+        languages = {c: 'Go' if i % 2 else 'Python' for i, c in enumerate(cves)}
+        same = [(languages, {c for c in cves[:30]}, [])] * 2
+        base = scoring.summarize(same)
+        tie = scoring.compare(base, base, labels=('a', 'b'), draws=500)
+        self.assertEqual(tie['groups']['overall']['pass@1']['diff'], 0.0)
+        self.assertEqual(tie['groups']['overall']['pass@1']['p_permutation'], 1.0)
+        better = scoring.summarize([(languages, {c for c in cves[:50]}, [])] * 2)
+        shifted = scoring.compare(base, better, labels=('a', 'b'), draws=500)
+        overall = shifted['groups']['overall']['pass@1']
+        self.assertAlmostEqual(overall['diff'], 20 / 60)
+        self.assertLess(overall['p_permutation'], 0.01)
+        self.assertLess(overall['p_normal'], 0.01)
+        self.assertEqual((overall['better'], overall['worse'], overall['tied']), (20, 0, 40))
+        self.assertEqual(set(shifted['groups']), {'overall', 'Go', 'Python'})
+        self.assertEqual(scoring.compare(base, better, draws=500), scoring.compare(base, better, draws=500))
+        other = scoring.summarize([({'CVE-X': 'Go'}, set(), [])])
+        with self.assertRaises(ValueError):
+            scoring.compare(base, other)
+
+    def test_compare_cli_writes_table_and_error_bar_chart(self):
+        cases = {'CVE-A': 'Go', 'CVE-B': 'Go', 'CVE-C': 'Python'}
+        with tempfile.TemporaryDirectory() as tmp:
+            reports = []
+            for name, solved in (('a', [{'CVE-A'}, set()]), ('b', [{'CVE-A', 'CVE-B'}, {'CVE-A'}])):
+                files = [write_sample(Path(tmp) / f'{name}{i}', cases, s) for i, s in enumerate(solved)]
+                reports.append(Path(tmp) / f'{name}.json')
+                scoring.aggregate(files, reports[-1])
+            with contextlib.redirect_stdout(io.StringIO()):
+                scoring.main(['--compare', str(reports[0]), str(reports[1]), '--labels', 'codex,opencode',
+                              '--draws', '200', '--out', str(Path(tmp) / 'cmp')])
+            result = json.loads((Path(tmp) / 'cmp/comparison.json').read_text())
+            table = (Path(tmp) / 'cmp/comparison.md').read_text()
+            svg = ElementTree.parse(Path(tmp) / 'cmp/error_bars.svg').getroot()
+        self.assertEqual(result['difference'], 'opencode - codex')
+        self.assertIn('| opencode - codex |', table)
+        self.assertIn('p=', table)
+        namespace = '{http://www.w3.org/2000/svg}'
+        bars = [e for e in svg.iter(f'{namespace}rect') if e.get('class') == 'bar']
+        whiskers = [e for e in svg.iter(f'{namespace}g') if e.get('class') == 'whisker']
+        # 2 harnesses x pass@1..2 x (overall, Go, Python)
+        self.assertEqual(len(bars), 12)
+        self.assertEqual(len(whiskers), len(bars))
 
     def test_merge_pools_selected_samples_and_records_provenance(self):
         with tempfile.TemporaryDirectory() as tmp:

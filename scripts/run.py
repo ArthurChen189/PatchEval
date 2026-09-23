@@ -24,7 +24,7 @@ if str(ROOT) not in sys.path:
 
 from scripts.infer.check_server import run_checks
 from scripts.infer.configure_harnesses import OPENCODE_VERSION, configure
-from scripts.infer.pass_at_k import aggregate
+from scripts.infer.pass_at_k import aggregate, format_scores
 
 
 def absolute(value):
@@ -36,8 +36,20 @@ OmegaConf.register_new_resolver("repo", lambda: str(ROOT), replace=True)
 OmegaConf.register_new_resolver("absolute", lambda value: str(absolute(value)), replace=True)
 
 
+def invocation_of(value):
+    """The nearest existing directory at or above a path that holds an invocation's resolved.yaml."""
+    path = absolute(value)
+    for candidate in (path, *path.parents):
+        if (candidate / "resolved.yaml").is_file():
+            return candidate
+    return None
+
+
 def run_folder(value):
-    """The invocation folder a path lies in: the component after hydra/ (or hydra/multirun/), else its name."""
+    """The invocation folder a path lies in (its name), for naming the invocations that act on it."""
+    invocation = invocation_of(value)
+    if invocation is not None:
+        return invocation.name
     parts = Path(str(value)).parts
     if "hydra" in parts:
         rest = parts[parts.index("hydra") + 1:]
@@ -45,6 +57,8 @@ def run_folder(value):
             rest = rest[1:]
         if rest:
             return rest[0]
+    if "generation" in parts and parts.index("generation") > 0:
+        return parts[parts.index("generation") - 1]
     return Path(str(value)).name
 
 
@@ -61,6 +75,46 @@ def run_name(action, harness, label, run_dir=None, resume_dir=None):
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", name)
 
 
+HARNESS_TITLES = {"codex": "Codex", "opencode": "OpenCode", "traecli": "TraeCLI"}
+
+
+def cap_label(tokens):
+    """16000 -> 16k, 8192 -> 8k; other values unchanged."""
+    tokens = int(tokens)
+    for unit in (1000, 1024):
+        if tokens % unit == 0:
+            return f"{tokens // unit}k"
+    return str(tokens)
+
+
+def group_name(model, harness, output_tokens):
+    """Results folder for one model x harness x output cap, e.g. Qwen3.8-27B_Codex_Max-output-token=16k."""
+    model = Path(str(model)).name
+    return f"{model}_{HARNESS_TITLES.get(str(harness), str(harness))}_Max-output-token={cap_label(output_tokens)}"
+
+
+def run_group(runs, action, model, harness, output_tokens, run_dir=None, resume_dir=None):
+    """Folder beneath paths.runs that an invocation belongs to.
+
+    Serving is shared by all harnesses. Evaluations and resumes join the group of
+    the run they act on (its folder under paths.runs, or else the group recorded in
+    its resolved.yaml), so they sit next to it whatever `harness` says.
+    """
+    if action in ("serve", "setup"):
+        return f"{Path(str(model)).name}_vLLM-serving"
+    source = run_dir if action == "evaluate" else resume_dir if action == "generate" else None
+    invocation = invocation_of(source) if source else None
+    if invocation is not None:
+        if invocation.parent.parent == absolute(runs) and invocation.parent.name not in ("hydra", "multirun"):
+            return invocation.parent.name
+        stored = OmegaConf.load(invocation / "resolved.yaml")
+        if OmegaConf.select(stored, "harness.name") and OmegaConf.select(stored, "model.output_tokens"):
+            return group_name(OmegaConf.select(stored, "model.served_name") or model,
+                              stored.harness.name, stored.model.output_tokens)
+    return group_name(model, harness, output_tokens)
+
+
+OmegaConf.register_new_resolver("run_group", run_group, replace=True)
 OmegaConf.register_new_resolver("run_name", run_name, replace=True)
 
 
@@ -271,9 +325,12 @@ def find_runs(cfg):
                 return sample_runs(generation, partial)
         raise ValueError(f"Not a generation run or multi-sample generation directory: {path}")
     root = absolute(cfg.paths.runs)
-    patterns = [f"*-{cfg.label}", f"hydra/*/generation/*-{cfg.label}",
+    # <group>/<invocation>/generation/..., multirun sweeps, and the older hydra/ and flat layouts.
+    patterns = [f"*-{cfg.label}", f"*/*/generation/*-{cfg.label}",
+                f"*/*/generation/sample_*/*-{cfg.label}",
+                f"multirun/*/*/generation/*-{cfg.label}",
+                f"multirun/*/*/generation/sample_*/*-{cfg.label}",
                 f"hydra/multirun/*/*/generation/*-{cfg.label}",
-                f"hydra/*/generation/sample_*/*-{cfg.label}",
                 f"hydra/multirun/*/*/generation/sample_*/*-{cfg.label}"]
     matches = [p for pattern in patterns for p in root.glob(pattern) if completed(p)]
     if not matches:
@@ -628,7 +685,7 @@ def dispatch(cfg, output):
                 "sample_runs": [str(run) for run in runs],
                 "configured_samples": expected or len(runs),
                 "partial": bool(expected) and len(runs) < expected})
-            scores = "  ".join(f"pass@{k}={summary[f'pass@{k}']:.2%}" for k in range(1, summary["n_samples"] + 1))
+            scores = format_scores(summary)
             note = f" (PARTIAL: {len(runs)} of {expected} samples)" if summary["partial"] else ""
             print(f"{summary['n_cves']} CVEs x {summary['n_samples']} samples: {scores}{note}")
             print(f"pass@k summary: {output / 'pass_at_k.json'}")
@@ -703,10 +760,25 @@ def main(cfg: DictConfig):
         raise SystemExit(str(exc)) from exc
 
 
+def quote_override(argument):
+    """Quote a key=value override whose value contains '=' (e.g. .../Max-output-token=16k/...).
+
+    Hydra's grammar rejects an unquoted '=' inside a value. Options, lists, dicts,
+    and values that are already quoted are left alone.
+    """
+    if argument.startswith("-") or "=" not in argument:
+        return argument
+    key, value = argument.split("=", 1)
+    if "=" not in value or value[:1] in ("'", '"', "[", "{"):
+        return argument
+    return f'{key}="' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
 def entrypoint(action=None):
     # Hydra resolves explicit relative run/sweep directories before dispatch.
     # Anchor its initialization as well as our own paths at the repository root.
     os.chdir(ROOT)
+    sys.argv[1:] = [quote_override(argument) for argument in sys.argv[1:]]
     if action:
         sys.argv.append(f"action={action}")
     main()

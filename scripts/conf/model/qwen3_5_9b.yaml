@@ -1,0 +1,12 @@
+path: Qwen/Qwen3.5-9B
+served_name: ${model.path}
+context_length: 262144 # max context length is 262144
+# Per-response output cap (reasoning included). Enforced server-wide by vLLM's
+# --override-generation-config max_new_tokens and rendered as OpenCode limit.output.
+output_tokens: 16000
+# Sampling temperature. null keeps the checkpoint's own generation_config defaults:
+# no harness or server override is sent. A number becomes vLLM's default for
+# requests that omit one (Codex, TraeCLI) and is set on every OpenCode agent.
+temperature: null
+reasoning_parser: qwen3
+tool_call_parser: qwen3_coder

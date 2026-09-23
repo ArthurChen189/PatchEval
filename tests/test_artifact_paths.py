@@ -144,6 +144,10 @@ class ArtifactPathTests(unittest.TestCase):
             caller = root / 'caller'
             caller.mkdir()
             (root / 'temp_run_script.sh').write_text((ROOT / 'temp_run_script.sh').read_text())
+            # The helper validates MODEL against scripts/conf/model/<MODEL>.yaml.
+            (root / 'scripts/conf/model').mkdir(parents=True)
+            for model in (ROOT / 'scripts/conf/model').glob('*.yaml'):
+                (root / 'scripts/conf/model' / model.name).write_text(model.read_text())
             for name in ('docker', 'uv'):
                 executable = root / 'bin' / name
                 executable.write_text('#!/bin/sh\nexit 0\n')
@@ -154,13 +158,8 @@ printf '%s\\n' "$*" >> "$CAPTURE"
 for arg in "$@"; do
   case "$arg" in
     action=*) action="${arg#*=}" ;;
-    hydra.run.dir=*) job_dir="${arg#*=}" ;;
   esac
 done
-if [[ "$action" == generate ]]; then
-  mkdir -p "$job_dir/generation/example/patches"
-  printf '{}' > "$job_dir/generation/example/summary.json"
-fi
 """)
             env = {**os.environ, 'PATH': str(root / 'bin') + os.pathsep + os.environ['PATH'],
                    'CAPTURE': str(root / 'calls')}
@@ -175,6 +174,9 @@ fi
                 expected = root / (override or 'patcheval/exp_agent/agent_runs')
                 self.assertEqual(len(calls), 3)
                 self.assertTrue(all(f'paths.runs={expected}' in call for call in calls))
-                self.assertIn(f'evaluation.run_dir={expected}/hydra/', calls[2])
-                self.assertEqual(len(list((expected / 'hydra').iterdir())), 1)
+                # Hydra chooses the grouped run directory; evaluation finds it by label.
+                self.assertNotIn('hydra.run.dir', calls[1])
+                label = next(a for a in calls[1].split() if a.startswith('label='))
+                self.assertIn(label, calls[2])
+                self.assertNotIn('evaluation.run_dir', calls[2])
             self.assertEqual(list(caller.iterdir()), [])
