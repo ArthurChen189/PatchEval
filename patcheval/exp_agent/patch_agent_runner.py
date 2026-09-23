@@ -33,6 +33,8 @@ class CommandResult:
     stderr: str
     duration_s: float
     timed_out: bool = False
+    # True when the agent never emitted its ready marker (it failed to start).
+    startup_stalled: bool = False
 
 
 @dataclass
@@ -51,6 +53,8 @@ class GenerationResult:
     patch_path: str
     error: str = ""
     trajectory_path: Optional[str] = None
+    startup_attempts: int = 1
+    startup_failed: bool = False
 
 
 def _safe_name(value: str, max_len: int = 100) -> str:
@@ -232,17 +236,31 @@ find /workspace -mindepth 1 -maxdepth 1 ! -name "$top_name" -exec rm -rf -- {{}}
         raise RuntimeError(result.stderr or result.stdout)
 
 
-async def _run_agent(container: str, workdir: str, command_template: str, result_dir: Path, env: dict[str, str], timeout_s: int) -> CommandResult:
+async def _run_agent(container: str, workdir: str, command_template: str, result_dir: Path, env: dict[str, str],
+                     timeout_s: int, ready_pattern: Optional[str] = None,
+                     startup_timeout: Optional[float] = None) -> CommandResult:
+    """Run the agent; with ready_pattern, stop early if it never starts.
+
+    The agent counts as started once its stdout matches ready_pattern. If that
+    does not happen within startup_timeout seconds, or the agent exits first,
+    the result is marked startup_stalled so the caller can retry from a fresh
+    container; the agent timeout then applies only to agents that started.
+    """
     values = {
         "prompt_file": "/results/prompt.txt",
         "workdir": workdir,
     }
     command = command_template.format(**values)
     started = time.monotonic()
+    watch = re.compile(ready_pattern.encode()) if ready_pattern and startup_timeout else None
     # Direct file descriptors avoid communicate() losing buffered output when
     # wait_for cancels it on timeout. Raw bytes remain available even on failure.
     stdout_path = result_dir / "agent_stdout.txt"
     stderr_path = result_dir / "agent_stderr.txt"
+
+    def ready_seen() -> bool:
+        return bool(watch.search(stdout_path.read_bytes())) if stdout_path.exists() else False
+
     with stdout_path.open("wb") as out, stderr_path.open("wb") as err:
         proc = await asyncio.create_subprocess_exec(
             "docker", "exec", "-w", workdir,
@@ -250,9 +268,31 @@ async def _run_agent(container: str, workdir: str, command_template: str, result
             container, "bash", "-lc", command,
             stdout=out, stderr=err,
         )
-        timed_out = False
+        timed_out = stalled = False
         try:
-            await asyncio.wait_for(proc.wait(), timeout=timeout_s)
+            if watch is None:
+                await asyncio.wait_for(proc.wait(), timeout=timeout_s)
+            else:
+                ready = False
+                while True:
+                    now = time.monotonic()
+                    remaining = started + timeout_s - now
+                    if remaining <= 0:
+                        raise asyncio.TimeoutError
+                    try:
+                        await asyncio.wait_for(proc.wait(), timeout=remaining if ready else min(1.0, remaining))
+                        break
+                    except asyncio.TimeoutError:
+                        if ready:
+                            raise
+                    ready = ready_seen()
+                    if not ready and time.monotonic() - started >= startup_timeout:
+                        stalled = True
+                        proc.kill()
+                        await proc.wait()
+                        break
+                if not stalled and not ready:
+                    stalled = not ready_seen()
         except asyncio.TimeoutError:
             timed_out = True
             if proc.returncode is None:
@@ -270,7 +310,8 @@ async def _run_agent(container: str, workdir: str, command_template: str, result
             return stream.read().decode("utf-8", errors="replace")
     return CommandResult(["docker", "exec", container, "bash", "-lc", command],
                          int(proc.returncode if proc.returncode is not None else 124),
-                         tail(stdout_path), tail(stderr_path), time.monotonic() - started, timed_out)
+                         tail(stdout_path), tail(stderr_path), time.monotonic() - started, timed_out,
+                         stalled)
 
 
 def _trajectory_spec(value: str) -> tuple[str, str]:
@@ -347,16 +388,43 @@ async def _run_one(sample: dict[str, Any], index: int, args: argparse.Namespace,
         workdir = "/workspace"
         agent_result: Optional[CommandResult] = None
         timed_out = False
+        ready_pattern = getattr(args, "ready_pattern", "")
+        startup_timeout = float(getattr(args, "startup_timeout", 0) or 0)
+        watchdog = bool(ready_pattern) and startup_timeout > 0
+        attempts = 1 + (int(getattr(args, "startup_retries", 0)) if watchdog else 0)
+        stalls: list[dict[str, Any]] = []
+        startup_failed = False
         try:
             env = {"PATCHAGENT_SESSION_ID": container}
-            run_result = await _run(_docker_run_args(container, image, work, mounts), timeout_s=1200)
-            if run_result.exit_code != 0:
-                raise RuntimeError(f"docker run failed: {run_result.stderr or run_result.stdout}")
-            workdir = await _detect_workdir(container, sample)
-            await _hide_workspace_payload(container, workdir, container)
-            prompt = _prompt(sample, workdir)
-            (work / "prompt.txt").write_text(prompt, encoding="utf-8")
-            agent_result = await _run_agent(container, workdir, args.agent_command, work, env, args.agent_timeout)
+            for attempt in range(1, attempts + 1):
+                run_result = await _run(_docker_run_args(container, image, work, mounts), timeout_s=1200)
+                if run_result.exit_code != 0:
+                    raise RuntimeError(f"docker run failed: {run_result.stderr or run_result.stdout}")
+                workdir = await _detect_workdir(container, sample)
+                await _hide_workspace_payload(container, workdir, container)
+                prompt = _prompt(sample, workdir)
+                (work / "prompt.txt").write_text(prompt, encoding="utf-8")
+                watch = ({"ready_pattern": ready_pattern, "startup_timeout": startup_timeout}
+                         if watchdog else {})
+                agent_result = await _run_agent(container, workdir, args.agent_command, work, env,
+                                                args.agent_timeout, **watch)
+                if not agent_result.startup_stalled:
+                    break
+                # The agent never started, so no model output exists: retrying from a
+                # fresh container cannot bias the result. Keep the stalled logs.
+                stalls.append({"attempt": attempt, "waited_s": round(agent_result.duration_s, 1),
+                               "exit_code": agent_result.exit_code})
+                if attempt == attempts:
+                    startup_failed = True
+                    raise RuntimeError(f"agent did not start after {attempts} attempts")
+                kept = work / f"startup_attempt_{attempt}"
+                kept.mkdir(exist_ok=True)
+                for name in ("agent_stdout.txt", "agent_stderr.txt"):
+                    if (work / name).exists():
+                        shutil.move(str(work / name), str(kept / name))
+                _log(f"{run_id}: agent did not start within {startup_timeout:.0f}s "
+                     f"(attempt {attempt}/{attempts}); retrying in a fresh container")
+                await _remove_container(container)
             timed_out = agent_result.timed_out
             if agent_result.exit_code != 0:
                 raise RuntimeError(f"agent failed with exit_code={agent_result.exit_code}")
@@ -383,34 +451,94 @@ async def _run_one(sample: dict[str, Any], index: int, args: argparse.Namespace,
         result = GenerationResult(index, cve, instance_id, image, workdir, container, status,
                                   status == "generated", agent_result.exit_code if agent_result else None,
                                   timed_out, time.monotonic() - started, str(patch_path), error,
-                                  str(trajectory) if trajectory else None)
+                                  str(trajectory) if trajectory else None,
+                                  startup_attempts=len(stalls) + (0 if startup_failed else 1),
+                                  startup_failed=startup_failed)
         if trajectory:
             _write_json(trajectory / "metadata.json", {"schema_version": 1, **asdict(result),
-                        "capture": capture, "work_logs": str(work),
+                        "capture": capture, "work_logs": str(work), "startup_stalls": stalls,
                         "agent_duration_s": agent_result.duration_s if agent_result else None})
         return result
+
+
+def _select(samples: list[dict[str, Any]], args: argparse.Namespace) -> list[tuple[int, dict[str, Any]]]:
+    """Choose cases, keeping each case's dataset index (it names its run_id)."""
+    indexed = list(enumerate(samples))
+    if not args.only_cves_file:
+        return indexed if args.limit < 0 else indexed[:args.limit]
+    wanted = {line.strip() for line in Path(args.only_cves_file).read_text(encoding="utf-8").splitlines()
+              if line.strip()}
+    selected = [(idx, sample) for idx, sample in indexed if str(sample["cve_id"]) in wanted]
+    missing = wanted - {str(sample["cve_id"]) for _, sample in selected}
+    if missing:
+        raise ValueError(f"--only-cves-file names CVEs absent from the dataset: {sorted(missing)[:5]}")
+    return selected
+
+
+def _prepare_rerun(run_root: Path, selected: list[tuple[int, dict[str, Any]]]) -> Path:
+    """Move the replaced cases' artifacts aside before rerunning them in place."""
+    if not (run_root / "results.jsonl").is_file():
+        raise ValueError(f"--rerun-into needs a completed run directory: {run_root}")
+    rerun_dir = run_root / "startup_reruns" / time.strftime("%Y%m%d_%H%M%S")
+    replaced = rerun_dir / "replaced"
+    for idx, sample in selected:
+        run_id = f"{idx:05d}-patcheval_{sample['cve_id']}"
+        for kind in ("trajectories", ".work"):
+            source = run_root / kind / run_id
+            if source.exists():
+                (replaced / kind).mkdir(parents=True, exist_ok=True)
+                shutil.move(str(source), str(replaced / kind / run_id))
+    rerun_dir.mkdir(parents=True, exist_ok=True)
+    return rerun_dir
+
+
+def _merge_rerun(run_root: Path, rerun_dir: Path, results: list[GenerationResult]) -> list[dict[str, Any]]:
+    """Replace rerun cases' rows in place and recompute the run summary."""
+    new = {r.cve: asdict(r) for r in results}
+    rows = [json.loads(line) for line in (run_root / "results.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()]
+    merged = [new.pop(row["cve"], row) for row in rows] + list(new.values())
+    partial = run_root / "results.jsonl.partial"
+    partial.write_text("".join(json.dumps(row, ensure_ascii=False) + "\n" for row in merged), encoding="utf-8")
+    partial.replace(run_root / "results.jsonl")
+    generated = sum(bool(row.get("patch_generated")) for row in merged)
+    _write_json(run_root / "summary.json", {"total": len(merged), "generated": generated,
+                                            "failed": len(merged) - generated})
+    record = {"rerun_dir": str(rerun_dir), "cves": [r.cve for r in results],
+              "generated": sum(r.patch_generated for r in results),
+              "startup_failed": sum(r.startup_failed for r in results)}
+    with (run_root / "startup_reruns.jsonl").open("a", encoding="utf-8") as log:
+        log.write(json.dumps(record) + "\n")
+    return merged
 
 
 async def _main(args: argparse.Namespace) -> int:
     input_path = Path(args.input).expanduser()
     samples = _read_json(input_path if input_path.is_absolute() else ROOT / input_path)
-    indexed = list(enumerate(samples))
-    selected = indexed if args.limit < 0 else indexed[:args.limit]
+    selected = _select(samples, args)
     _require_dataset_images([sample for _, sample in selected])
-    output_base = Path(args.output_dir).expanduser()
-    output_base = (output_base if output_base.is_absolute() else ROOT / output_base).resolve()
-    output_base.mkdir(parents=True, exist_ok=True)
-    run_root = Path(tempfile.mkdtemp(prefix=time.strftime("%Y%m%d_%H%M%S-"),
-                                    suffix=f"-{_safe_name(args.run_label or 'run')}",
-                                    dir=output_base))
+    rerun_dir = None
+    if args.rerun_into:
+        run_root = Path(args.rerun_into).expanduser().resolve()
+        rerun_dir = _prepare_rerun(run_root, selected)
+        _write_json(rerun_dir / "run_metadata.json", vars(args) | {"run_root": str(run_root),
+                    "total_cases": len(selected)})
+    else:
+        output_base = Path(args.output_dir).expanduser()
+        output_base = (output_base if output_base.is_absolute() else ROOT / output_base).resolve()
+        output_base.mkdir(parents=True, exist_ok=True)
+        run_root = Path(tempfile.mkdtemp(prefix=time.strftime("%Y%m%d_%H%M%S-"),
+                                        suffix=f"-{_safe_name(args.run_label or 'run')}",
+                                        dir=output_base))
     for sub in ["patches", ".work"]:
         (run_root / sub).mkdir(parents=True, exist_ok=True)
     args.run_root = str(run_root)
-    _write_json(run_root / "run_metadata.json", vars(args) | {"run_root": str(run_root), "total_cases": len(selected)})
+    if rerun_dir is None:
+        _write_json(run_root / "run_metadata.json", vars(args) | {"run_root": str(run_root), "total_cases": len(selected)})
     mounts = _parse_mounts(args.mount)
     sem = asyncio.Semaphore(args.concurrency)
     tasks = [asyncio.create_task(_run_one(sample, idx, args, sem, mounts)) for idx, sample in selected]
-    results_path = run_root / "results.jsonl"
+    results_path = (rerun_dir / "results.jsonl") if rerun_dir else run_root / "results.jsonl"
     results = []
     with results_path.open("w", encoding="utf-8") as f:
         for i, task in enumerate(asyncio.as_completed(tasks), 1):
@@ -420,9 +548,14 @@ async def _main(args: argparse.Namespace) -> int:
             f.flush()
             _log(f"progress {i}/{len(tasks)}: {result.cve} {result.status}")
     generated = sum(r.patch_generated for r in results)
-    _write_json(run_root / "summary.json", {"total": len(results), "generated": generated, "failed": len(results) - generated})
-    print(f"Run directory: {run_root}")
-    print(f"Generated patches: {generated}/{len(results)}")
+    if rerun_dir:
+        merged = _merge_rerun(run_root, rerun_dir, results)
+        print(f"Reran {len(results)} cases in {run_root}: {generated} generated; "
+              f"run now {sum(bool(r.get('patch_generated')) for r in merged)}/{len(merged)}")
+    else:
+        _write_json(run_root / "summary.json", {"total": len(results), "generated": generated, "failed": len(results) - generated})
+        print(f"Run directory: {run_root}")
+        print(f"Generated patches: {generated}/{len(results)}")
     return 0 if generated == len(results) else 1
 
 
@@ -441,6 +574,16 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Archive full task prompts, CLI streams, and configured native sessions")
     p.add_argument("--trajectory-path", type=_trajectory_spec, action="append", default=[],
                    help="Optional native session artifact NAME=/container/path (never a credential home)")
+    p.add_argument("--ready-pattern", default="",
+                   help="Regex the agent prints to stdout once it has started; enables the startup watchdog")
+    p.add_argument("--startup-timeout", type=float, default=300,
+                   help="Seconds to wait for --ready-pattern before retrying in a fresh container")
+    p.add_argument("--startup-retries", type=int, default=2,
+                   help="Fresh-container retries for an agent that never starts")
+    p.add_argument("--only-cves-file", default="",
+                   help="File of CVE IDs to run (one per line); keeps their dataset indices and ignores --limit")
+    p.add_argument("--rerun-into", default="",
+                   help="Existing run directory whose selected cases are rerun and replaced in place")
     return p
 
 

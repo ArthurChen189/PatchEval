@@ -73,6 +73,10 @@ AGENT_MOUNTS=(
 AGENT_EXTRA_ARGS=()
 AGENT_COMMAND="rm -rf /tmp/codex-home && cp -a /opt/codex-home-src /tmp/codex-home && CODEX_HOME=/tmp/codex-home /usr/local/bin/codex exec --profile ${CODEX_PROFILE} --json --dangerously-bypass-approvals-and-sandbox -C {workdir} < {prompt_file}"
 
+# Printed once Codex has opened and started its first turn; the runner's
+# startup watchdog retries a task in a fresh container if it never appears.
+AGENT_READY_PATTERN='"type":"turn.started"'
+
 # Export session records only; never copy credential-bearing runtime homes.
 AGENT_TRAJECTORY_PATHS=(
   "codex_sessions=/tmp/codex-home/sessions"

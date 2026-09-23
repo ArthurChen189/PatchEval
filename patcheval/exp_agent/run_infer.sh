@@ -18,6 +18,7 @@ if [[ ! -f "$AGENT_FILE" ]]; then
 fi
 
 AGENT_TRAJECTORY_PATHS=()
+AGENT_READY_PATTERN=""
 # shellcheck source=/dev/null
 source "$AGENT_FILE"
 
@@ -28,6 +29,21 @@ mount_args=()
 for mount in "${AGENT_MOUNTS[@]:-}"; do
   mount_args+=(--mount "$mount")
 done
+
+# Startup watchdog: an agent that never prints its ready marker is retried in a
+# fresh container (no model output exists yet, so results are unaffected).
+startup_args=()
+if [[ -n "$AGENT_READY_PATTERN" ]]; then
+  startup_args+=(--ready-pattern "$AGENT_READY_PATTERN"
+    --startup-timeout "${STARTUP_TIMEOUT:-300}" --startup-retries "${STARTUP_RETRIES:-2}")
+fi
+# Resume: rerun selected cases inside an existing run directory.
+if [[ -n "${RERUN_CVES_FILE:-}" ]]; then
+  startup_args+=(--only-cves-file "$RERUN_CVES_FILE")
+fi
+if [[ -n "${RERUN_INTO:-}" ]]; then
+  startup_args+=(--rerun-into "$RERUN_INTO")
+fi
 
 trajectory_args=()
 case "${SAVE_TRAJECTORIES:-false}" in
@@ -50,6 +66,7 @@ python "${SCRIPT_DIR}/patch_agent_runner.py" \
   "${mount_args[@]}" \
   "${AGENT_EXTRA_ARGS[@]}" \
   "${trajectory_args[@]}" \
+  "${startup_args[@]}" \
   --agent-command "$AGENT_COMMAND" \
   --agent-timeout "${AGENT_TIMEOUT:-2400}" \
   --container-prefix "patcheval-${AGENT}"

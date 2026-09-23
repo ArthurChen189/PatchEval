@@ -12,6 +12,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 
 import hydra
 from hydra.core.hydra_config import HydraConfig
@@ -369,6 +370,62 @@ def record_harness_version(cfg, binary, output):
     return record
 
 
+def ready_pattern(harness):
+    """The adapter's ready marker: printed once the agent app has started."""
+    adapter = ROOT / f"patcheval/exp_agent/agents/{harness}.sh"
+    match = re.search(r"^AGENT_READY_PATTERN='([^']*)'", adapter.read_text(), re.M) if adapter.is_file() else None
+    return match.group(1) if match else ""
+
+
+def startup_failures(run, pattern):
+    """CVEs whose agent never started (no model output), so rerunning them is unbiased.
+
+    Runner records carry startup_failed; older runs are recognised by an agent
+    failure whose archived stdout lacks the adapter's ready marker. Genuine
+    timeouts and repair failures print the marker and are never selected.
+    """
+    marker = re.compile(pattern) if pattern else None
+    failed = []
+    if not (run / "results.jsonl").is_file():
+        return failed
+    for line in (run / "results.jsonl").read_text().splitlines():
+        if not line.strip():
+            continue
+        row = json.loads(line)
+        if row.get("patch_generated"):
+            continue
+        if row.get("startup_failed"):
+            failed.append(row["cve"])
+            continue
+        if "startup_failed" in row or marker is None or "agent failed" not in (row.get("error") or ""):
+            continue
+        trajectory = Path(row["trajectory_path"]) if row.get("trajectory_path") else None
+        if trajectory is None or not trajectory.is_dir():
+            matches = list((run / "trajectories").glob(f"*-patcheval_{row['cve']}"))
+            trajectory = matches[0] if len(matches) == 1 else None
+        stdout = trajectory / "stdout.jsonl" if trajectory else None
+        if stdout is None or not stdout.is_file():
+            continue
+        if not marker.search(stdout.read_text(errors="replace")):
+            failed.append(row["cve"])
+    return failed
+
+
+def still_running(base, window_s=900):
+    """An unfinished run in BASE that was written recently, i.e. probably live."""
+    if not base.is_dir():
+        return None
+    now = time.time()
+    for run in base.iterdir():
+        if not run.is_dir() or completed(run):
+            continue
+        work = run / ".work"
+        paths = [run, run / "results.jsonl", work] + (list(work.iterdir()) if work.is_dir() else [])
+        if any(path.exists() and now - path.stat().st_mtime < window_s for path in paths):
+            return run
+    return None
+
+
 def prepare_resume(cfg, output):
     """Adopt a previous generation invocation's settings and list its missing samples."""
     target = absolute(cfg.generation.resume_dir)
@@ -391,10 +448,22 @@ def prepare_resume(cfg, output):
     harness_home = None if cfg.harness.config else target / "harnesses"
     samples = cfg.generation.samples
     bases = [target / "generation" / (f"sample_{i}" if samples > 1 else "") for i in range(samples)]
-    pending = [i for i, base in enumerate(bases)
-               if not (base.is_dir() and any(completed(run) for run in base.iterdir()))]
+    pending, reruns = [], []
+    pattern = ready_pattern(cfg.harness.name)
+    for i, base in enumerate(bases):
+        runs = [run for run in base.iterdir() if completed(run)] if base.is_dir() else []
+        if not runs:
+            active = still_running(base)
+            if active:
+                raise ValueError(f"Sample {i} appears to be still generating ({active} was updated in the "
+                                 "last 15 minutes); resume after that run finishes or is stopped")
+            pending.append(i)
+        elif len(runs) == 1 and (cves := startup_failures(runs[0], pattern)):
+            reruns.append((i, runs[0], cves))
     print(f"Resuming {target}: samples {pending or 'none'} of {samples} still to generate", flush=True)
-    return target, harness_home, pending
+    for i, run, cves in reruns:
+        print(f"  sample {i}: rerunning {len(cves)} tasks whose agent never started", flush=True)
+    return target, harness_home, pending, reruns
 
 
 def check_resume_version(target, record):
@@ -534,9 +603,9 @@ def dispatch(cfg, output):
             print(f"{summary['n_cves']} CVEs x {summary['n_samples']} samples: {scores}{note}")
             print(f"pass@k summary: {output / 'pass_at_k.json'}")
     else:
-        target, harness_home, pending = output, None, None
+        target, harness_home, pending, reruns = output, None, None, []
         if cfg.generation.get("resume_dir"):
-            target, harness_home, pending = prepare_resume(cfg, output)
+            target, harness_home, pending, reruns = prepare_resume(cfg, output)
         command, env = generation_job(cfg, output, harness_home)
         save_config(cfg, output)
         prefix = {"codex": "CODEX", "opencode": "OPENCODE", "traecli": "TRAE"}[cfg.harness.name]
@@ -549,7 +618,23 @@ def dispatch(cfg, output):
         # Independent samples for pass@k run one after another against the same
         # server and harness config, each in its own generation/sample_<i>/.
         samples = cfg.generation.samples
-        incomplete = []
+        incomplete, rerun_log = [], []
+        # Completed samples first: rerun, in place, tasks whose agent never started.
+        for index, run, cves in reruns:
+            listing = output / f"rerun_sample_{index}.txt"
+            if not cfg.dry_run:
+                listing.write_text("\n".join(cves) + "\n")
+            rerun_env = {**env, "OUTPUT_BASE": str(run.parent), "RERUN_INTO": str(run),
+                         "RERUN_CVES_FILE": str(listing)}
+            print(f"Rerunning {len(cves)} startup failures in sample {index}", flush=True)
+            before = (run / "startup_reruns.jsonl").read_text() if (run / "startup_reruns.jsonl").is_file() else ""
+            try:
+                run_command(command, rerun_env, cfg)
+            except subprocess.CalledProcessError as exc:
+                after = (run / "startup_reruns.jsonl").read_text() if (run / "startup_reruns.jsonl").is_file() else ""
+                if after == before:
+                    raise ValueError(f"Rerun in sample {index} did not complete (runner exit {exc.returncode})") from exc
+            rerun_log.append({"sample": index, "run": str(run), "cves": cves})
         for index in (pending if pending is not None else range(samples)):
             base = target / "generation" / (f"sample_{index}" if samples > 1 else "")
             sample_env = {**env, "OUTPUT_BASE": str(base)}
@@ -572,7 +657,7 @@ def dispatch(cfg, output):
         if target != output and not cfg.dry_run:
             with (target / "resumed_by.jsonl").open("a", encoding="utf-8") as log:
                 log.write(json.dumps({"invocation": str(output), "samples": list(pending),
-                                      "incomplete": incomplete}) + "\n")
+                                      "incomplete": incomplete, "startup_reruns": rerun_log}) + "\n")
         if incomplete:
             raise ValueError(f"Samples {incomplete} did not complete; rerun with "
                              f"generation.resume_dir={target}")

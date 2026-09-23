@@ -317,7 +317,11 @@ and the resume command. `evaluation.allow_partial=true` (`PARTIAL=1` in
 samples into that invocation: it adopts the invocation's recorded model,
 harness, label, endpoint, dataset, and generation settings, reuses its rendered
 `harnesses/` configs, refuses to continue if the harness CLI version differs
-from the recorded `harness-version.json`, and appends to `resumed_by.jsonl`. Each sample is converted and evaluated into
+from the recorded `harness-version.json`, and appends to `resumed_by.jsonl`.
+Resume also reruns, in place, every task of a completed sample whose agent never
+started (see the startup watchdog below), then generates missing samples; it
+refuses to touch a sample whose unfinished run was written in the last 15
+minutes, since that run is probably still generating. Each sample is converted and evaluated into
 `eval_inputs/sample_<i>/` and `evaluation_output/sample_<i>/`, and
 `pass_at_k.json` reports pass@1 through pass@samples overall and per language,
 using the unbiased estimator 1 - C(n-c,k)/C(n,k); pass@1 is the mean
@@ -494,6 +498,23 @@ destination. On other hosts, configure Docker's data-root **and** containerd's
 `root` for the desired mounted filesystem before downloading. The daemon also
 needs socket access (`docker` group or equivalent); a missing SDK in system
 Python is unrelated to disk layout.
+
+Startup watchdog: at high concurrency some OpenCode 1.18.31 sessions hang
+right after "initialized" (no model request, no sockets, near-zero CPU) and would
+otherwise burn the whole agent timeout as an empty-patch failure. Each adapter
+declares `AGENT_READY_PATTERN`, printed once the app has started (`"type":"step_start"`
+for OpenCode, `"type":"turn.started"` for Codex; TraeCLI has none, so no watchdog).
+If it does not appear within `STARTUP_TIMEOUT` seconds (default 300), or the agent
+exits first, the runner removes the container and retries in a fresh one, up to
+`STARTUP_RETRIES` times (default 2). No model output exists at that point, so a
+retry cannot bias results; the agent timeout applies only to agents that started.
+Results record `startup_attempts` and `startup_failed`; trajectory metadata lists
+each stall (`startup_stalls`), and stalled logs stay under
+`.work/<task>/startup_attempt_<n>/`. For runs made before the watchdog, resume
+recognises such tasks as agent failures whose archived stdout lacks the ready
+marker. Reruns replace the task's row, patch, and trajectory in the original run
+directory (replaced artifacts move to `startup_reruns/<time>/replaced/`, and
+`startup_reruns.jsonl` records each rerun) and recompute `summary.json`.
 
 The runner defaults to `AGENT_TIMEOUT=2400` seconds (40 minutes; Hydra
 `generation.timeout=2400`). A timed-out agent

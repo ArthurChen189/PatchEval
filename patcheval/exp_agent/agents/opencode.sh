@@ -40,6 +40,10 @@ AGENT_MOUNTS+=("${OPENCODE_CONFIG_HOME}:/opt/opencode-config-src:ro")
 AGENT_MOUNTS+=("${OPENCODE_DATA_HOME}:/opt/opencode-data-src:ro")
 AGENT_COMMAND='rm -rf /tmp/opencode-config /tmp/opencode-data && mkdir -p /tmp/opencode-config /tmp/opencode-data && cp -a /opt/opencode-config-src/. /tmp/opencode-config/ && cp -a /opt/opencode-data-src/. /tmp/opencode-data/ && XDG_CONFIG_HOME=/tmp/opencode-config XDG_DATA_HOME=/tmp/opencode-data opencode run --format json --auto < {prompt_file}'
 
+# Printed once OpenCode has opened and begun its first model step; the runner's
+# startup watchdog retries a task in a fresh container if it never appears.
+AGENT_READY_PATTERN='"type":"step_start"'
+
 # Export session records only; never copy credential-bearing runtime homes.
 AGENT_TRAJECTORY_PATHS=(
   "opencode.db=/tmp/opencode-data/opencode/opencode.db"

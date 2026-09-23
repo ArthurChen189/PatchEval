@@ -28,7 +28,8 @@ set -euo pipefail
 # single run, any sample run, or a multi-sample invocation directory; every
 # sample of the invocation is evaluated and pass_at_k.json is written:
 #   MAX_WORKERS=16 bash temp_run_script.sh evaluate /absolute/path/to/generation/run
-# Generate an invocation's missing samples (same settings), then evaluate all:
+# Rerun tasks whose agent never started (startup watchdog), generate missing
+# samples (same settings), then evaluate all. Wait until the run has finished:
 #   MAX_WORKERS=16 bash temp_run_script.sh resume /path/to/hydra/vllm-full-XXXXXXXX
 #
 # The server defaults (scripts/conf/config.yaml) run 8 replicas x 8 requests
