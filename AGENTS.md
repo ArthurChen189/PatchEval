@@ -459,6 +459,49 @@ end-to-end verified dataset is unchanged; no new partition is introduced. An
 unsuccessful repair is not an infrastructure failure. Keep reference patches
 and fix metadata out of repair prompts and tools.
 
+### Token usage and cost inputs
+
+`scripts/infer/token_usage.py` (stdlib only) normalizes per-task usage for both
+harnesses: `requests`, `input_tokens` (all prompt tokens, cached included),
+`cached_input_tokens`/`uncached_input_tokens` (`null` when not reported, never
+0), `output_tokens` (reasoning included), `reasoning_tokens`,
+`max_request_input_tokens`, `source`, `final_record`, and `consistency`.
+Sources: Codex native session `token_usage_record` (one per response id, present
+even for timed-out tasks whose stdout lacks `turn.completed`), checked against the
+cumulative `token_count` after a clean finish. For OpenCode, the archived session
+database (read from a temporary copy with its WAL), which also holds subagent calls
+such as `explore` that never appear in stdout; stdout `step_finish` is the
+fallback and the check for primary agents. OpenCode's `input` excludes cache
+reads/writes and its `output` excludes reasoning; both are added back.
+
+Generation snapshots the server's `/metrics` (vLLM counters summed over engines:
+prompt, cached-prompt, and generation tokens, requests, prefix cache, spec
+decode) before and after each sample into `generation/sample_<i>/server_metrics.json`
+with wall time and GPU-hours. These counters are server-wide, so a sample's delta
+is only attributable to it when nothing else uses the server. Each finished sample
+run (and each resume rerun) gets `token_usage.jsonl` (one row per task) and
+`token_usage_summary.json`. Evaluation writes `token_usage.json` beside
+`pass_at_k.json`: totals, per sample, per language, solved vs unsolved,
+tokens per solved run, and per-CVE rows. Failures here only warn.
+
+`server.prompt_tokens_details=true` (default) serves with
+`--enable-prompt-tokens-details`, so Chat Completions (OpenCode) reports cached
+prompt tokens as Responses (Codex) already does; it changes reported usage only.
+Runs made without it have unknown OpenCode cache splits. Because resume compares
+serving argv, runs started before this default cannot be resumed on a server that
+has it (and vice versa).
+
+```bash
+python -m scripts.infer.token_usage --run GENERATION_RUN            # per-task rows + summary
+python -m scripts.infer.token_usage --eval EVAL[:sample_0,sample_1] ... --out DIR   # pooled token_usage.json
+python -m scripts.infer.token_usage --compare A/token_usage.json B/token_usage.json \
+  --labels codex,opencode [--prices input=0.30,cached=0.03,output=1.20] --out DIR
+```
+`--compare` writes `token_comparison.md/json` and `token_usage.svg` (stacked
+uncached/cached input, output, reasoning; per task and per solved run). With
+`--prices` (USD per 1M tokens) it adds costs. When the cache split is unknown, all
+input is priced as uncached and the cost is marked as an upper bound.
+
 ## Docker storage on the ephemeral disk
 
 On this host, `../ephemeral` links to the mounted filesystem at `/mnt/local`.

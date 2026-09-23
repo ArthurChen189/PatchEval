@@ -252,6 +252,12 @@ def completed_runner(fail_codes):
 
 
 class GenerationSampleTests(unittest.TestCase):
+    def setUp(self):
+        # Generation snapshots the server's /metrics; keep unit tests off the network.
+        stub = patch.object(workflow, 'server_snapshot', return_value=None)
+        stub.start()
+        self.addCleanup(stub.stop)
+
     def generate(self, tmp, fail_codes, *overrides):
         cfg = config('action=generate', 'harness=opencode', 'server.host=127.0.0.1', *overrides)
         cfg.harness.binary = '/bin/true'

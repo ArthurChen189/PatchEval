@@ -184,6 +184,12 @@ class RerunTests(unittest.TestCase):
 
 
 class ResumeRerunTests(unittest.TestCase):
+    def setUp(self):
+        # Generation snapshots the server's /metrics; keep unit tests off the network.
+        stub = patch.object(workflow, 'server_snapshot', return_value=None)
+        stub.start()
+        self.addCleanup(stub.stop)
+
     def test_resume_reruns_startup_failures_before_missing_samples(self):
         with tempfile.TemporaryDirectory() as tmp:
             original = config('action=generate', 'harness=opencode', 'server.host=10.0.0.9',

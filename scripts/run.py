@@ -154,11 +154,13 @@ def validate(cfg):
            for arg in cfg.server.extra_args):
         raise ValueError("Set model.output_tokens/model.temperature instead of generation-config extra_args")
     managed = {"--speculative-config", "-sc", "--enable-prefix-caching", "--no-enable-prefix-caching",
-               "--enable-chunked-prefill", "--no-enable-chunked-prefill", "--max-num-seqs"}
+               "--enable-chunked-prefill", "--no-enable-chunked-prefill", "--max-num-seqs",
+               "--enable-prompt-tokens-details", "--no-enable-prompt-tokens-details"}
     if any(arg.split("=", 1)[0] in managed for arg in cfg.server.extra_args):
-        raise ValueError("Set server.speculative/prefix_caching/chunked_prefill/max_running_requests "
+        raise ValueError("Set server.speculative/prefix_caching/chunked_prefill/prompt_tokens_details/"
+                         "max_running_requests "
                          "instead of passing those flags in server.extra_args")
-    for key in ("prefix_caching", "chunked_prefill"):
+    for key in ("prefix_caching", "chunked_prefill", "prompt_tokens_details"):
         if not isinstance(cfg.server.get(key, True), bool):
             raise ValueError(f"server.{key} must be a boolean")
     speculative = cfg.server.get("speculative")
@@ -237,7 +239,10 @@ def serve_command(cfg):
     speculative = cfg.server.get("speculative")
     if speculative is not None:
         args.extend(["--speculative-config", json.dumps(OmegaConf.to_container(speculative, resolve=True))])
-    for key, flag in (("prefix_caching", "prefix-caching"), ("chunked_prefill", "chunked-prefill")):
+    # prompt_tokens_details makes Chat Completions (OpenCode) report cached prompt
+    # tokens, as Responses (Codex) already does; it changes reported usage only.
+    for key, flag in (("prefix_caching", "prefix-caching"), ("chunked_prefill", "chunked-prefill"),
+                      ("prompt_tokens_details", "prompt-tokens-details")):
         if cfg.server.get(key) is not None:
             args.append(f"--{'' if cfg.server[key] else 'no-'}enable-{flag}")
     return args + list(cfg.server.extra_args)
@@ -269,6 +274,38 @@ def check_resume_server(target, record):
     if (previous.get("argv"), previous.get("vllm")) != (record.get("argv"), record.get("vllm")):
         raise ValueError(f"The serving configuration differs from the one {target} was generated "
                          "with; restart the server with its recorded settings (server.json) to resume")
+
+
+def server_snapshot(cfg):
+    """vLLM token counters summed over engines, or None if /metrics is unreachable."""
+    import urllib.request
+    from scripts.infer.token_usage import parse_metrics
+    try:
+        url = re.sub(r"/v1/?$", "", cfg.server.base_url or endpoint(cfg)) + "/metrics"
+        with urllib.request.urlopen(url, timeout=10) as response:
+            return parse_metrics(response.read().decode("utf-8", errors="replace"))
+    except (OSError, ValueError) as exc:
+        print(f"WARNING: cannot read server metrics ({exc}); token counters not recorded", file=sys.stderr)
+        return None
+
+
+def record_usage(cfg, base, runs, before, started):
+    """Server token counters for one sample, and per-task usage for its runs (never fatal)."""
+    from scripts.infer.token_usage import metrics_delta, run_usage
+    after = server_snapshot(cfg) if before is not None else None
+    if after is not None:
+        gpus = cfg.server.data_parallel * cfg.server.tensor_parallel
+        record = metrics_delta(before, after, time.time() - started, gpus)
+        base.mkdir(parents=True, exist_ok=True)
+        (base / "server_metrics.json").write_text(json.dumps(record, indent=2) + "\n")
+    for run in runs:
+        try:
+            _, summary = run_usage(run, cfg.harness.name)
+            print(f"Token usage {run.name}: input={summary['input_tokens']:,} "
+                  f"output={summary['output_tokens']:,} ({summary['tasks_with_usage']}/{summary['tasks']} tasks)",
+                  flush=True)
+        except (OSError, ValueError, KeyError) as exc:
+            print(f"WARNING: token usage not extracted for {run}: {exc}", file=sys.stderr)
 
 
 SAMPLE_DIR = re.compile(r"sample_(\d+)")
@@ -689,6 +726,13 @@ def dispatch(cfg, output):
             note = f" (PARTIAL: {len(runs)} of {expected} samples)" if summary["partial"] else ""
             print(f"{summary['n_cves']} CVEs x {summary['n_samples']} samples: {scores}{note}")
             print(f"pass@k summary: {output / 'pass_at_k.json'}")
+            try:
+                from scripts.infer.token_usage import evaluation_usage
+                usage = evaluation_usage([output], output)["overall"]
+                print(f"Token usage: input={usage['input_tokens']:,} output={usage['output_tokens']:,} "
+                      f"over {usage['tasks_with_usage']} task runs: {output / 'token_usage.json'}")
+            except (OSError, ValueError, KeyError) as exc:
+                print(f"WARNING: token usage not summarized: {exc}", file=sys.stderr)
     else:
         target, harness_home, pending, reruns = output, None, None, []
         if cfg.generation.get("resume_dir"):
@@ -722,12 +766,15 @@ def dispatch(cfg, output):
                 if after == before:
                     raise ValueError(f"Rerun in sample {index} did not complete (runner exit {exc.returncode})") from exc
             rerun_log.append({"sample": index, "run": str(run), "cves": cves})
+            if not cfg.dry_run:
+                record_usage(cfg, run.parent, [run], None, time.time())
         for index in (pending if pending is not None else range(samples)):
             base = target / "generation" / (f"sample_{index}" if samples > 1 else "")
             sample_env = {**env, "OUTPUT_BASE": str(base)}
             if samples > 1:
                 print(f"Generation sample {index + 1}/{samples}", flush=True)
             before = {run for run in base.iterdir() if completed(run)} if base.is_dir() else set()
+            snapshot, started = (None if cfg.dry_run else server_snapshot(cfg)), time.time()
             try:
                 run_command(command, sample_env, cfg)
             except subprocess.CalledProcessError as exc:
@@ -741,6 +788,9 @@ def dispatch(cfg, output):
                 else:
                     print(f"Sample {index} completed with failed tasks (runner exit {exc.returncode}); "
                           "continuing", flush=True)
+            if not cfg.dry_run:
+                finished = {run for run in base.iterdir() if completed(run)} if base.is_dir() else set()
+                record_usage(cfg, base, sorted(finished - before), snapshot, started)
         if target != output and not cfg.dry_run:
             with (target / "resumed_by.jsonl").open("a", encoding="utf-8") as log:
                 log.write(json.dumps({"invocation": str(output), "samples": list(pending),

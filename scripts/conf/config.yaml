@@ -40,6 +40,8 @@ server:
     num_speculative_tokens: 3
   prefix_caching: true # Reuse KV (and Mamba "align" states) across agent turns.
   chunked_prefill: true # Interleave long prompt prefill with decoding.
+  # Report cached prompt tokens on Chat Completions too (OpenCode); usage accounting only.
+  prompt_tokens_details: true
   extra_args: [] # Literal argv entries, never evaluated by a shell.
 
 configure:
