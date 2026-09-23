@@ -130,8 +130,12 @@ class RerunTests(unittest.TestCase):
                 ('CVE-NEW-STARTED', False, {'startup_failed': False, **timeout}),
                 ('CVE-EMPTY-DIFF', False, {'error': 'collect patch failed: '}),
                 ('CVE-OK', True, {}),
+                ('CVE-INTERRUPTED', False, timeout),
             ], {'CVE-OLD-TIMEOUT': '{"type":"step_start"}\n', 'CVE-EMPTY-DIFF': ''})
-            self.assertEqual(workflow.startup_failures(root, READY), ['CVE-OLD-HUNG', 'CVE-NEW-FAILED'])
+            # An interrupted rerun leaves only a placeholder trajectory without stdout.
+            (root / 'trajectories/00006-patcheval_CVE-INTERRUPTED/stdout.jsonl').unlink()
+            self.assertEqual(workflow.startup_failures(root, READY),
+                             ['CVE-OLD-HUNG', 'CVE-NEW-FAILED', 'CVE-INTERRUPTED'])
             self.assertEqual(workflow.ready_pattern('opencode'), READY)
             self.assertEqual(workflow.ready_pattern('codex'), '"type":"turn.started"')
             self.assertEqual(workflow.ready_pattern('traecli'), '')

@@ -72,7 +72,8 @@ hydra:
   job:
     chdir: false
   run:
-    dir: ${absolute:${paths.runs}}/hydra/${now:%Y%m%d_%H%M%S_%f}-${action}
+    # e.g. <time>-generate-codex-<label>, <time>-evaluate-<generation folder>, <time>-resume-<folder>.
+    dir: ${absolute:${paths.runs}}/hydra/${now:%Y%m%d_%H%M%S_%f}-${run_name:${action},${harness.name},${label},${evaluation.run_dir},${generation.resume_dir}}
   sweep:
     dir: ${absolute:${paths.runs}}/hydra/multirun/${now:%Y%m%d_%H%M%S_%f}
     subdir: ${hydra.job.num}

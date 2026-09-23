@@ -65,6 +65,39 @@ class PassAtKTests(unittest.TestCase):
                 scoring.aggregate([bad], Path(tmp) / 'out.json')
 
 
+class MergeTests(unittest.TestCase):
+    def evaluation(self, root, name, generation, solved_by_sample, server):
+        invocation = root / generation
+        invocation.mkdir(parents=True, exist_ok=True)
+        (invocation / 'resolved.yaml').write_text('harness:\n  name: opencode\n')
+        if server:
+            (invocation / 'server.json').write_text(json.dumps({'argv': server}))
+        evaluation = root / name
+        (evaluation).mkdir()
+        (evaluation / 'resolved.yaml').write_text(f'evaluation:\n  run_dir: {invocation / "generation"}\n')
+        for sample, solved in solved_by_sample.items():
+            write_sample(evaluation / 'eval_inputs' / sample, {'CVE-A': 'Go', 'CVE-B': 'Go'}, set())
+            write_sample(evaluation / 'evaluation_output' / sample, {'CVE-A': 'Go', 'CVE-B': 'Go'}, solved)
+        return evaluation
+
+    def test_merge_pools_selected_samples_and_records_provenance(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            new = self.evaluation(root, 'eval-new', 'gen-new', {'sample_0': {'CVE-A'}, 'sample_1': set()}, ['fast'])
+            old = self.evaluation(root, 'eval-old', 'gen-old',
+                                  {'sample_0': {'CVE-B'}, 'sample_1': {'CVE-A'}, 'sample_2': {'CVE-A', 'CVE-B'}}, None)
+            result = scoring.merge([str(new), str(old)], root / 'merged', {str(old): ['sample_0', 'sample_1']})
+            self.assertEqual(result['n_samples'], 4)
+            self.assertEqual(result['per_cve_solved_count'], {'CVE-A': 2, 'CVE-B': 1})
+            self.assertAlmostEqual(result['pass@4'], 1.0)
+            self.assertEqual([(s['evaluation'], s['sample']) for s in result['merged_from']],
+                             [(str(new), 'sample_0'), (str(new), 'sample_1'), (str(old), 'sample_0'), (str(old), 'sample_1')])
+            self.assertTrue(result['mixed_serving_settings'])
+            self.assertEqual(result['merged_from'][0]['invocation'], str(root / 'gen-new'))
+            with self.assertRaises(FileExistsError):
+                scoring.merge([str(new)], root / 'merged')
+
+
 class MultiSampleDiscoveryTests(unittest.TestCase):
     def test_label_and_explicit_paths_find_every_sample_in_order(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -30,7 +30,7 @@ set -euo pipefail
 #   MAX_WORKERS=16 bash temp_run_script.sh evaluate /absolute/path/to/generation/run
 # Rerun tasks whose agent never started (startup watchdog), generate missing
 # samples (same settings), then evaluate all. Wait until the run has finished:
-#   MAX_WORKERS=16 bash temp_run_script.sh resume /path/to/hydra/vllm-full-XXXXXXXX
+#   MAX_WORKERS=16 bash temp_run_script.sh resume /path/to/hydra/gen-opencode-full-20260923_040610-XXXXXXXX
 #
 # The server defaults (scripts/conf/config.yaml) run 8 replicas x 8 requests
 # (max-num-seqs is per replica) with MTP speculative decoding, prefix caching,
@@ -164,7 +164,7 @@ case "${1:-help}" in
     "${workflow[@]}" action=check
     # An isolated Hydra invocation makes the evaluation input unambiguous.
     mkdir -p "${RUNS_DIR}/hydra"
-    job_dir="$(mktemp -d "${RUNS_DIR}/hydra/vllm-${experiment}-XXXXXXXX")"
+    job_dir="$(mktemp -d "${RUNS_DIR}/hydra/gen-${HARNESS}-${experiment}-$(date -u +%Y%m%d_%H%M%S)-XXXXXXXX")"
     label="qwen_vllm_${HARNESS}_${experiment}_$(date -u +%Y%m%d_%H%M%S)"
     "${workflow[@]}" action=generate "experiment=${experiment}" "label=${label}" \
       "hydra.run.dir=${job_dir}" "generation.concurrency=${concurrency}" \

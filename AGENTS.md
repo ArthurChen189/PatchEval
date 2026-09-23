@@ -80,8 +80,19 @@ when the CLI is launched from another directory. The entrypoint anchors executio
 Hydra itself does not change directories. Explicit relative `hydra.run.dir` and
 `hydra.sweep.dir` overrides therefore also resolve from the repository root. `paths.runs` defaults to `patcheval/exp_agent/agent_runs/`.
 Each invocation records its config and overrides in
-`paths.runs/hydra/<timestamp>-<action>/.hydra/` and its resolved settings in
-`resolved.yaml`. Generation writes its run beneath that invocation's
+`paths.runs/hydra/<timestamp>-<name>/.hydra/` and its resolved settings in
+`resolved.yaml`. The `run_name` resolver in `scripts/run.py` names the folder
+after its work: `generate-<harness>-<label>`, `resume-<resumed folder>`,
+`evaluate-<scored generation folder>` (or `evaluate-<label>`), `check-<harness>`,
+`configure-<harness>`, `analyze-<harness>`, `serve`, `setup`.
+`temp_run_script.sh smoke|full` names its generation invocation
+`gen-<harness>-<experiment>-<UTC time>-XXXXXXXX`. Kept runs in this checkout were
+renamed on 2026-09-23 to `gen-`/`eval-`/`serve-<harness>-<experiment>-<server>-<samples>-<date>`
+(server tags `v1-8kcap`, `oldserver16k`, `mtp16k`), with references inside runs
+and `analysis_reports/` rewritten; `hydra/INDEX.md` describes each folder and
+`hydra/RENAMES.tsv` maps the old names. Redundant invocations are staged in
+`paths.runs/_to_delete/` (outside `hydra/`, so label lookup ignores them) with a
+`DELETE_LIST.md` of reasons. Generation writes its run beneath that invocation's
 `generation/` directory, keeping sweep jobs isolated. `--multirun` uses
 `paths.runs/hydra/multirun/`. Resolved snapshots may contain values obtained
 from environment interpolations, so keep credentials out of config files and
@@ -327,7 +338,13 @@ minutes, since that run is probably still generating. Each sample is converted a
 using the unbiased estimator 1 - C(n-c,k)/C(n,k); pass@1 is the mean
 single-sample solve rate over all samples, and pass@4 with four samples is the
 fraction of cases solved at least once. Per-sample solve counts and evaluator
-execution errors are included for inspection. `generation.samples=1` keeps the
+execution errors are included for inspection. To pool samples from several
+evaluations (for example two runs of the same harness), use
+`python -m scripts.infer.pass_at_k --eval EVAL_DIR[:sample_0,sample_1] --eval ... --out NEW_DIR`;
+all samples must cover the same CVEs, and the report lists each sample's
+evaluation, generation run, `server.json`, and harness version and sets
+`mixed_serving_settings`/`mixed_harness_versions` when they differ.
+`generation.samples=1` keeps the
 previous single-run layout; legacy single runs are evaluated as before, with a
 one-sample `pass_at_k.json`. Evaluation never implicitly starts generation. Each evaluation invocation
 stores conversion input in its own `eval_inputs/` directory and reports/logs in
@@ -511,8 +528,9 @@ retry cannot bias results; the agent timeout applies only to agents that started
 Results record `startup_attempts` and `startup_failed`; trajectory metadata lists
 each stall (`startup_stalls`), and stalled logs stay under
 `.work/<task>/startup_attempt_<n>/`. For runs made before the watchdog, resume
-recognises such tasks as agent failures whose archived stdout lacks the ready
-marker. Reruns replace the task's row, patch, and trajectory in the original run
+recognises such tasks as agent failures whose archived stdout is missing or
+lacks the ready marker; a missing stream also recovers a rerun that was
+interrupted after moving old artifacts aside but before merging results. Reruns replace the task's row, patch, and trajectory in the original run
 directory (replaced artifacts move to `startup_reruns/<time>/replaced/`, and
 `startup_reruns.jsonl` records each rerun) and recompute `summary.json`.
 

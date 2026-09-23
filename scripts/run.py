@@ -36,6 +36,34 @@ OmegaConf.register_new_resolver("repo", lambda: str(ROOT), replace=True)
 OmegaConf.register_new_resolver("absolute", lambda value: str(absolute(value)), replace=True)
 
 
+def run_folder(value):
+    """The invocation folder a path lies in: the component after hydra/ (or hydra/multirun/), else its name."""
+    parts = Path(str(value)).parts
+    if "hydra" in parts:
+        rest = parts[parts.index("hydra") + 1:]
+        if rest[:1] == ("multirun",):
+            rest = rest[1:]
+        if rest:
+            return rest[0]
+    return Path(str(value)).name
+
+
+def run_name(action, harness, label, run_dir=None, resume_dir=None):
+    """Descriptive suffix for an invocation directory, e.g. generate-codex-<label>."""
+    if action == "generate":
+        name = f"resume-{run_folder(resume_dir)}" if resume_dir else f"generate-{harness}-{label}"
+    elif action == "evaluate":
+        name = f"evaluate-{run_folder(run_dir) if run_dir else label}"
+    elif action in ("check", "configure", "analyze"):
+        name = f"{action}-{harness}"
+    else:
+        name = str(action)
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", name)
+
+
+OmegaConf.register_new_resolver("run_name", run_name, replace=True)
+
+
 def positive(value, name):
     if isinstance(value, bool) or not isinstance(value, int) or value < 1:
         raise ValueError(f"{name} must be a positive integer")
@@ -381,8 +409,9 @@ def startup_failures(run, pattern):
     """CVEs whose agent never started (no model output), so rerunning them is unbiased.
 
     Runner records carry startup_failed; older runs are recognised by an agent
-    failure whose archived stdout lacks the adapter's ready marker. Genuine
-    timeouts and repair failures print the marker and are never selected.
+    failure whose archived stdout is missing or lacks the adapter's ready
+    marker. Genuine timeouts and repair failures print the marker and are never
+    selected.
     """
     marker = re.compile(pattern) if pattern else None
     failed = []
@@ -404,9 +433,10 @@ def startup_failures(run, pattern):
             matches = list((run / "trajectories").glob(f"*-patcheval_{row['cve']}"))
             trajectory = matches[0] if len(matches) == 1 else None
         stdout = trajectory / "stdout.jsonl" if trajectory else None
-        if stdout is None or not stdout.is_file():
-            continue
-        if not marker.search(stdout.read_text(errors="replace")):
+        # A missing stream is no evidence that the agent started. This also
+        # recovers an interrupted rerun, which moves the old trajectory aside
+        # before the replacement row is merged.
+        if stdout is None or not stdout.is_file() or not marker.search(stdout.read_text(errors="replace")):
             failed.append(row["cve"])
     return failed
 

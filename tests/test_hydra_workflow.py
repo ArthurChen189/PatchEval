@@ -53,6 +53,28 @@ class HydraWorkflowTests(unittest.TestCase):
                              {'context': 32768, 'output': 4096})
             self.assertTrue((Path(tmp) / 'record/resolved.yaml').exists())
 
+    def test_invocation_directories_are_named_after_their_work(self):
+        runs = '/runs/hydra'
+        cases = {
+            ('generate', 'codex', 'my_run', None, None): 'generate-codex-my_run',
+            ('generate', 'opencode', 'x', None, f'{runs}/gen-opencode-full-1-abc'): 'resume-gen-opencode-full-1-abc',
+            ('evaluate', 'codex', 'local_codex', f'{runs}/gen-opencode-full-1-abc/generation/sample_0/r', None):
+                'evaluate-gen-opencode-full-1-abc',
+            ('evaluate', 'codex', 'local_codex', f'{runs}/multirun/stamp/0/generation/run', None): 'evaluate-stamp',
+            ('evaluate', 'codex', 'my run', None, None): 'evaluate-my_run',
+            ('check', 'opencode', 'l', None, None): 'check-opencode',
+            ('serve', 'codex', 'l', None, None): 'serve',
+        }
+        for args, expected in cases.items():
+            self.assertEqual(workflow.run_name(*args), expected)
+        with tempfile.TemporaryDirectory() as tmp:
+            result = subprocess.run([sys.executable, str(ROOT / 'scripts/run.py'), 'action=check', 'dry_run=true',
+                                     'harness=opencode', 'server.host=127.0.0.1', f'paths.runs={tmp}'],
+                                    capture_output=True, text=True, check=True)
+            names = [p.name for p in (Path(tmp) / 'hydra').iterdir()]
+        self.assertEqual(len(names), 1, result.stdout)
+        self.assertRegex(names[0], r'^\d{8}_\d{6}_\d{6}-check-opencode$')
+
     def test_serving_command_preserves_literal_arguments(self):
         cfg = config('server.host=127.0.0.1', 'model.context_length=65536')
         cfg.model.path = '/models/path with spaces'
