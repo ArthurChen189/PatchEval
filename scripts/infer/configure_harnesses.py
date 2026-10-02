@@ -12,6 +12,9 @@ OPENCODE_VERSION = "1.18.31"
 # Newer docs also list `scout`, which this release lacks; unknown names would
 # define new custom agents, so only these receive a temperature.
 OPENCODE_AGENTS = ("build", "plan", "general", "explore", "compaction", "summary", "title")
+# Every tool runs without approval except the web tools, which could fetch the
+# upstream fix. The agents' Docker network also has no internet route.
+OPENCODE_PERMISSION = {"*": "allow", "webfetch": "deny", "websearch": "deny", "codesearch": "deny"}
 
 
 def configure(output, base_url, model, context, force=False, output_tokens=16000, temperature=None):
@@ -48,7 +51,7 @@ supports_websockets = false
         "$schema": "https://opencode.ai/config.json",
         "model": f"vllm/{model}",
         "small_model": f"vllm/{model}",
-        "permission": "allow",
+        "permission": dict(OPENCODE_PERMISSION),
         "provider": {"vllm": {
             "npm": "@ai-sdk/openai-compatible", "name": "Local vLLM",
             "options": {"baseURL": base_url, "apiKey": "local"},
@@ -73,6 +76,7 @@ supports_websockets = false
             "codex_protocol": "responses", "opencode_protocol": "chat/completions",
             "output_tokens": output_tokens, "temperature": temperature,
             "opencode_version_validated": OPENCODE_VERSION,
+            "web_tools": {"codex": "web_search disabled", "opencode": OPENCODE_PERMISSION},
             "enforcement": {
                 "codex": "vLLM --override-generation-config (max_new_tokens, default temperature)",
                 "opencode": "limit.output and agent.*.temperature; vLLM max_new_tokens also caps",

@@ -300,17 +300,21 @@ class HydraWorkflowTests(unittest.TestCase):
             cfg.paths.runs = tmp
             with patch.dict(os.environ, {'LIMIT': '230', 'CONCURRENCY': '99'}):
                 with patch.object(workflow.subprocess, 'run') as execute, \
-                     patch.object(workflow.subprocess, 'check_output', return_value='1.18.31\n'):
+                     patch.object(workflow.subprocess, 'check_output', return_value='1.18.31\n'), \
+                     patch.object(workflow, 'network_preflight') as preflight:
                     workflow.dispatch(cfg, Path(tmp) / 'hydra job')
+            preflight.assert_called_once()
             self.assertEqual(execute.call_count, 4)
             self.assertEqual([call.kwargs['env']['OUTPUT_BASE'] for call in execute.call_args_list],
                              [str(Path(tmp) / f'hydra job/generation/sample_{i}') for i in range(4)])
             cfg.generation.samples = 1
             with patch.object(workflow.subprocess, 'run') as execute, \
-                 patch.object(workflow.subprocess, 'check_output', return_value='1.18.31\n'):
+                 patch.object(workflow.subprocess, 'check_output', return_value='1.18.31\n'), \
+                 patch.object(workflow, 'network_preflight'):
                 workflow.dispatch(cfg, Path(tmp) / 'single job')
             args, kwargs = execute.call_args
             self.assertEqual(args[0][-2:], ['opencode', 'local_opencode_smoke'])
+            self.assertEqual(kwargs['env']['AGENT_NETWORK'], 'patcheval-offline')
             self.assertEqual(kwargs['env']['LIMIT'], '5')
             self.assertEqual(kwargs['env']['CONCURRENCY'], '8')
             self.assertEqual(kwargs['env']['AGENT_TIMEOUT'], '42')

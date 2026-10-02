@@ -38,7 +38,12 @@ OPENCODE_DATA_HOME="$(cd "${OPENCODE_CONFIG_HOME}/../data" && pwd)"
 AGENT_MOUNTS+=("${OPENCODE_BIN}:/usr/local/bin/opencode:ro")
 AGENT_MOUNTS+=("${OPENCODE_CONFIG_HOME}:/opt/opencode-config-src:ro")
 AGENT_MOUNTS+=("${OPENCODE_DATA_HOME}:/opt/opencode-data-src:ro")
-AGENT_COMMAND='rm -rf /tmp/opencode-config /tmp/opencode-data && mkdir -p /tmp/opencode-config /tmp/opencode-data && cp -a /opt/opencode-config-src/. /tmp/opencode-config/ && cp -a /opt/opencode-data-src/. /tmp/opencode-data/ && XDG_CONFIG_HOME=/tmp/opencode-config XDG_DATA_HOME=/tmp/opencode-data opencode run --format json --auto < {prompt_file}'
+# Agent containers have no internet route (see patch_agent_runner.py --network).
+# These flags stop OpenCode's own startup downloads (models.dev catalog, updates,
+# default plugins, LSP servers, sharing), which would otherwise wait on the network;
+# EXA would enable the websearch/codesearch tools.
+OPENCODE_OFFLINE_ENV='OPENCODE_DISABLE_MODELS_FETCH=1 OPENCODE_DISABLE_AUTOUPDATE=1 OPENCODE_DISABLE_DEFAULT_PLUGINS=1 OPENCODE_DISABLE_LSP_DOWNLOAD=1 OPENCODE_DISABLE_SHARE=1'
+AGENT_COMMAND="rm -rf /tmp/opencode-config /tmp/opencode-data && mkdir -p /tmp/opencode-config /tmp/opencode-data && cp -a /opt/opencode-config-src/. /tmp/opencode-config/ && cp -a /opt/opencode-data-src/. /tmp/opencode-data/ && unset OPENCODE_ENABLE_EXA OPENCODE_EXPERIMENTAL_EXA && ${OPENCODE_OFFLINE_ENV} XDG_CONFIG_HOME=/tmp/opencode-config XDG_DATA_HOME=/tmp/opencode-data opencode run --format json --auto < {prompt_file}"
 
 # Printed once OpenCode has opened and begun its first model step; the runner's
 # startup watchdog retries a task in a fresh container if it never appears.

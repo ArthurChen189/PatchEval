@@ -174,22 +174,62 @@ def validate(cfg):
               f"{slots} running-request slots; extra model calls will queue", file=sys.stderr)
 
 
-def bridge_host():
+def network_info(name):
+    """(gateway, internal) of a Docker network, or None if it does not exist."""
     try:
-        host = subprocess.check_output(
-            ["docker", "network", "inspect", "bridge", "--format",
-             "{{(index .IPAM.Config 0).Gateway}}"], text=True,
-        ).strip()
-    except (OSError, subprocess.CalledProcessError) as exc:
-        raise ValueError("Cannot discover Docker bridge; set server.host or server.base_url") from exc
-    if not host or host == "<no value>":
+        result = subprocess.run(["docker", "network", "inspect", name, "--format",
+                                 "{{(index .IPAM.Config 0).Gateway}} {{.Internal}}"],
+                                capture_output=True, text=True)
+    except OSError as exc:
+        raise ValueError(f"Cannot inspect Docker network {name!r}; set server.host or server.base_url") from exc
+    if result.returncode != 0:
+        return None
+    gateway, _, internal = result.stdout.strip().partition(" ")
+    return gateway, internal == "true"
+
+
+def ensure_offline_network(name, create=True):
+    """Gateway of the agents' internal Docker network, creating the network if needed.
+
+    Agent containers join this network: they reach the model server on its
+    gateway but have no internet route. A non-internal network is refused.
+    """
+    info = network_info(name)
+    if info is None and create:
+        subprocess.run(["docker", "network", "create", "--internal", "--driver", "bridge", name],
+                       check=True, stdout=subprocess.DEVNULL)
+        print(f"Created internal Docker network {name}", flush=True)
+        info = network_info(name)
+    if info is None:
+        raise ValueError(f"Docker network {name!r} does not exist (the first serve or generation creates it); "
+                         "set server.host or server.base_url for a dry run")
+    gateway, internal = info
+    if not internal:
+        raise ValueError(f"Docker network {name!r} is not internal, so agents would have internet access; "
+                         "remove it or set generation.network to an internal network")
+    if not gateway or gateway == "<no value>":
+        raise ValueError(f"Docker network {name!r} has no IPv4 gateway; set server.host or server.base_url")
+    return gateway
+
+
+def bridge_host(network=None, create=True):
+    """Gateway address agents use to reach the host: the offline network's, or Docker's bridge."""
+    if network:
+        return ensure_offline_network(network, create)
+    info = network_info("bridge")
+    if info is None or not info[0] or info[0] == "<no value>":
         raise ValueError("Cannot discover Docker bridge; set server.host or server.base_url")
-    return host
+    return info[0]
+
+
+def agent_network(cfg):
+    """generation.network; null keeps Docker's default bridge (internet access)."""
+    return cfg.generation.get("network")
 
 
 def bind_host(cfg):
     if cfg.server.host is None:
-        cfg.server.host = bridge_host()
+        cfg.server.host = bridge_host(agent_network(cfg), create=not cfg.dry_run)
     return cfg.server.host
 
 
@@ -198,7 +238,7 @@ def endpoint(cfg):
         return cfg.server.base_url.rstrip("/")
     host = bind_host(cfg)
     if host in {"0.0.0.0", "::"}:
-        host = bridge_host()
+        host = bridge_host(agent_network(cfg), create=not cfg.dry_run)
     if ":" in host:
         host = f"[{host}]"
     cfg.server.base_url = f"http://{host}:{cfg.server.port}/v1"
@@ -458,6 +498,7 @@ def generation_job(cfg, output, harness_home=None):
            "DATASET": str(absolute(cfg.paths.dataset)), "OUTPUT_BASE": str(output / "generation"),
            "LIMIT": str(cfg.generation.limit), "CONCURRENCY": str(cfg.generation.concurrency),
            "AGENT_TIMEOUT": str(cfg.generation.timeout),
+           "AGENT_NETWORK": agent_network(cfg) or "default",
            "SAVE_TRAJECTORIES": str(cfg.generation.save_trajectories).lower()}
     return ["bash", str(ROOT / "patcheval/exp_agent/run_infer.sh"), cfg.harness.name, cfg.label], env
 
@@ -489,6 +530,51 @@ def record_harness_version(cfg, binary, output):
             print(f"WARNING: rendered OpenCode settings were validated with {OPENCODE_VERSION}, "
                   f"but {binary} reports {version or 'an unknown version'}", file=sys.stderr)
     (output / "harness-version.json").write_text(json.dumps(record, indent=2) + "\n")
+    return record
+
+
+NETWORK_PROBE = """
+command -v timeout >/dev/null || {{ echo probe=no-timeout; exit 0; }}
+timeout 10 bash -c '</dev/tcp/{host}/{port}' 2>/dev/null && echo model=reachable || echo model=unreachable
+timeout 5 bash -c '</dev/tcp/1.1.1.1/443' 2>/dev/null && echo internet_ip=open || echo internet_ip=blocked
+timeout 5 getent hosts pypi.org >/dev/null 2>&1 && echo dns=resolves || echo dns=fails
+timeout 5 bash -c '</dev/tcp/pypi.org/443' 2>/dev/null && echo internet_name=open || echo internet_name=blocked
+"""
+
+
+def network_preflight(cfg, output):
+    """Prove, from a case container on the agents' network, that the model is reachable and the internet is not.
+
+    The result is saved as network-check.json in the invocation; generation stops
+    on any internet route or an unreachable model endpoint.
+    """
+    from urllib.parse import urlparse
+    network = agent_network(cfg)
+    record = {"network": network, "checked_utc": datetime.datetime.now(datetime.timezone.utc).isoformat()}
+    if network is None:
+        print("WARNING: generation.network=null: agent containers use Docker's default bridge with "
+              "internet access", file=sys.stderr, flush=True)
+        (output / "network-check.json").write_text(json.dumps({**record, "internet": "not blocked"}, indent=2) + "\n")
+        return record
+    dataset = json.loads(absolute(cfg.paths.dataset).read_text())
+    image = dataset[0]["image_url"]
+    url = urlparse(endpoint(cfg))
+    host, port = url.hostname, url.port or (443 if url.scheme == "https" else 80)
+    probe = subprocess.run(["docker", "run", "--rm", "--network", network, image, "bash", "-c",
+                            NETWORK_PROBE.format(host=host, port=port)],
+                           capture_output=True, text=True, timeout=300)
+    results = dict(line.split("=", 1) for line in probe.stdout.split() if "=" in line)
+    record.update({"internal": True, "image": image, "model_endpoint": f"{host}:{port}", "results": results,
+                   "probe_exit_code": probe.returncode, "probe_stderr": probe.stderr[-2000:]})
+    (output / "network-check.json").write_text(json.dumps(record, indent=2) + "\n")
+    if results.get("internet_ip") != "blocked" or results.get("internet_name") != "blocked":
+        raise ValueError(f"Agent network {network!r} reaches the internet ({results or probe.stderr[-500:]}); "
+                         "see network-check.json")
+    if results.get("model") != "reachable":
+        raise ValueError(f"The model endpoint {host}:{port} is unreachable from Docker network {network!r} "
+                         f"({results or probe.stderr[-500:]}); serve on that network's gateway "
+                         "(server.host=null) or set server.base_url")
+    print(f"Network check: {network} reaches {host}:{port}; internet blocked", flush=True)
     return record
 
 
@@ -565,6 +651,12 @@ def prepare_resume(cfg, output):
         OmegaConf.update(cfg, key, stored[key], merge=False)
     for key in ("limit", "concurrency", "timeout", "samples", "save_trajectories"):
         OmegaConf.update(cfg, f"generation.{key}", stored.generation[key])
+    # Invocations made before offline agents recorded no network: they ran on
+    # Docker's default bridge, so their remaining samples do too.
+    OmegaConf.update(cfg, "generation.network", stored.generation.get("network"))
+    if stored.generation.get("network") is None:
+        print(f"WARNING: {target} was generated with internet access; resumed samples keep it "
+              "for comparability", file=sys.stderr, flush=True)
     for key in ("host", "port", "base_url"):
         OmegaConf.update(cfg, f"server.{key}", stored.server[key])
     cfg.paths.dataset = stored.paths.dataset
@@ -743,6 +835,7 @@ def dispatch(cfg, output):
         if not cfg.dry_run:
             record = record_harness_version(cfg, env[f"{prefix}_BIN"], output)
             server = record_server(cfg, output)
+            network_preflight(cfg, output)
             if target != output:
                 check_resume_version(target, record)
                 check_resume_server(target, server)

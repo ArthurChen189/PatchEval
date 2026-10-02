@@ -56,7 +56,10 @@ RUNS_DIR="${RUNS_DIR:-${REPO_ROOT}/patcheval/exp_agent/agent_runs}"
 # Shell-created invocation directories use the same base as Hydra paths.
 cd "$REPO_ROOT"
 RUNS_DIR="$(realpath -m "$RUNS_DIR")"
-SERVER_HOST="${SERVER_HOST:-172.17.0.1}"
+# Agent containers run on this internal Docker network (no internet route). With
+# SERVER_HOST empty, the server binds the network's gateway, where agents reach it.
+AGENT_NETWORK="${AGENT_NETWORK:-patcheval-offline}"
+SERVER_HOST="${SERVER_HOST:-}"
 SERVER_PORT="${SERVER_PORT:-30000}"
 SERVER_WAIT_TIMEOUT="${SERVER_WAIT_TIMEOUT:-900}"
 HARNESS="${HARNESS:-codex}"
@@ -90,8 +93,11 @@ if [[ -z "$MODEL_ID" ]]; then
 fi
 
 workflow=(bash "${REPO_ROOT}/scripts/run.sh"
-  "paths.runtime=${RUNTIME_DIR}" "paths.runs=${RUNS_DIR}"
-  "server.host=${SERVER_HOST}" "server.port=${SERVER_PORT}" "harness=${HARNESS}" "model=${MODEL}")
+  "paths.runtime=${RUNTIME_DIR}" "paths.runs=${RUNS_DIR}" "generation.network=${AGENT_NETWORK}"
+  "server.port=${SERVER_PORT}" "harness=${HARNESS}" "model=${MODEL}")
+if [[ -n "$SERVER_HOST" ]]; then
+  workflow+=("server.host=${SERVER_HOST}")
+fi
 
 # A sudo invocation loses user harness credentials and creates root-owned runs.
 if [[ $EUID -eq 0 && -n "${SUDO_USER:-}" ]]; then
@@ -121,10 +127,22 @@ ensure_docker() {
   return 1
 }
 
+# The address the server binds: SERVER_HOST, or the agents' network gateway
+# (creating the internal network if needed), as the Hydra workflow resolves it.
+resolved_server_host() {
+  if [[ -n "$SERVER_HOST" ]]; then
+    printf '%s\n' "$SERVER_HOST"
+    return
+  fi
+  docker network inspect "$AGENT_NETWORK" >/dev/null 2>&1 ||
+    docker network create --internal --driver bridge "$AGENT_NETWORK" >/dev/null
+  docker network inspect "$AGENT_NETWORK" --format '{{(index .IPAM.Config 0).Gateway}}'
+}
+
 wait_for_server() {
   # Poll readiness for MODEL_ID (from scripts/conf/model/${MODEL}.yaml) without
   # generating tokens or launching a server.
-  uv run --project "$REPO_ROOT" python - "$SERVER_HOST" "$SERVER_PORT" "$SERVER_WAIT_TIMEOUT" "$MODEL_ID" <<'PYTHON'
+  uv run --project "$REPO_ROOT" python - "$(resolved_server_host)" "$SERVER_PORT" "$SERVER_WAIT_TIMEOUT" "$MODEL_ID" <<'PYTHON'
 import json
 import os
 import sys

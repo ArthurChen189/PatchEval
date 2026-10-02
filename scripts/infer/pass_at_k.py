@@ -200,6 +200,39 @@ def merge(evaluations, destination, select=None):
     return aggregate(files, destination / "pass_at_k.json", metadata)
 
 
+def load_cve_list(path):
+    """CVE IDs from a JSON list, a JSON object with "excluded_cves", or one ID per line."""
+    text = Path(path).read_text(encoding="utf-8")
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return {line.strip() for line in text.splitlines() if line.strip() and not line.startswith("#")}
+    return set(data["excluded_cves"] if isinstance(data, dict) else data)
+
+
+def restrict(report, exclude):
+    """A pass@k report recomputed without the excluded CVEs (same samples, estimator, and error bars).
+
+    Used to rescore evaluations on the CVEs no audited run had contaminated.
+    """
+    exclude = set(exclude)
+    language = report["per_cve_language"]
+    solved = report["per_cve_solved_samples"]
+    kept = {cve: lang for cve, lang in language.items() if cve not in exclude}
+    if not kept:
+        raise ValueError("Every CVE is excluded")
+    samples = [(kept, {cve for cve in kept if i in solved[cve]}, ()) for i in range(report["n_samples"])]
+    result = {key: value for key, value in report.items()
+              if key in ("sample_runs", "configured_samples", "partial", "merged_from",
+                         "mixed_serving_settings", "mixed_harness_versions")}
+    result.update(summarize(samples))
+    # Execution errors are recorded per sample, not per CVE, so they cover every CVE.
+    result["per_sample_execution_errors"] = report.get("per_sample_execution_errors")
+    result["restricted"] = {"from_n_cves": report["n_cves"], "excluded_cves": sorted(exclude & set(language)),
+                            "note": "per_sample_execution_errors count all CVEs before exclusion"}
+    return result
+
+
 def _paired(a, b, draws, rng):
     """Paired difference b - a over CVEs: SE, normal and sign-flip permutation p-values."""
     d = [y - x for x, y in zip(a, b)]
@@ -293,12 +326,16 @@ def svg_error_bars(reports, labels, path):
            f'font-family="sans-serif" font-size="11">', f'<rect width="{width}" height="{height}" fill="white"/>',
            f'<text x="{left}" y="18" font-size="14" font-weight="bold">pass@k with 95% CI (error bars) '
            f'over CVEs</text>']
-    lo = 0.4
+    # Axis floor: 40%, lowered in 10-point steps so no bar or whisker is clipped.
+    lowest = min((v for report in reports for group in groups for k in range(1, n + 1)
+                  for v in ((report if group == "overall" else report["per_language"][group])
+                            ["uncertainty"][f"pass@{k}"]["ci95"] or [1.0])), default=1.0)
+    lo = min(0.4, math.floor(lowest * 10) / 10)
     y = lambda v: top + ph - (max(v, lo) - lo) / (1 - lo) * ph
     for g, group in enumerate(groups):
         x0 = left + g * pw
         out.append(f'<text x="{x0 + pw / 2}" y="{top - 8}" text-anchor="middle" font-weight="bold">{group}</text>')
-        for tick in (0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0):
+        for tick in [round(lo + 0.1 * i, 1) for i in range(int(round((1 - lo) * 10)) + 1)]:
             out.append(f'<line x1="{x0}" x2="{x0 + pw - 20}" y1="{y(tick):.1f}" y2="{y(tick):.1f}" stroke="#ddd"/>')
             if g == 0:
                 out.append(f'<text x="{x0 - 5}" y="{y(tick) + 4:.1f}" text-anchor="end">{tick:.0%}</text>')
@@ -350,9 +387,27 @@ def main(argv=None):
                         help="Paired comparison (B - A) of two pass_at_k.json reports")
     parser.add_argument("--labels", default="a,b", help="Names for the two --compare reports (default a,b)")
     parser.add_argument("--draws", type=int, default=20000, help="Permutation draws for --compare")
+    parser.add_argument("--restrict", metavar="PASS_AT_K_JSON",
+                        help="Recompute a report without the CVEs listed in --exclude-cves")
+    parser.add_argument("--exclude-cves", metavar="FILE",
+                        help="JSON list, JSON with excluded_cves, or one CVE per line (for --restrict)")
     parser.add_argument("--out", required=True, help="New directory for the merged pass_at_k.json, "
                                                      "or directory for comparison.{json,md} and error_bars.svg")
     args = parser.parse_args(argv)
+    if args.restrict:
+        if not args.exclude_cves:
+            parser.error("--restrict needs --exclude-cves")
+        report = json.loads(Path(args.restrict).read_text(encoding="utf-8"))
+        result = restrict(report, load_cve_list(args.exclude_cves))
+        result["restricted"].update({"source": str(Path(args.restrict).resolve()),
+                                     "exclude_cves_file": str(Path(args.exclude_cves).resolve())})
+        destination = Path(args.out)
+        destination.mkdir(parents=True, exist_ok=True)
+        (destination / "pass_at_k.json").write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+        print(f"{result['n_cves']} of {report['n_cves']} CVEs x {result['n_samples']} samples: "
+              f"{format_scores(result)}")
+        print(f"Wrote {destination / 'pass_at_k.json'}")
+        return
     if args.compare:
         labels = args.labels.split(",")
         if len(labels) != 2:

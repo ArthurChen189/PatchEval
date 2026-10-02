@@ -59,6 +59,11 @@ generation:
   samples: 4 # Independent generation runs per case; evaluation reports pass@1..pass@samples.
   resume_dir: null # A previous generation invocation: generate only its missing samples, with its settings.
   save_trajectories: true # Preserve per-task prompts, events, stderr, and native sessions.
+  # Internal Docker network for agent containers: reaches the model server on its
+  # gateway (server.host=null binds there) but has no internet route. Created if
+  # missing; a non-internal network is refused. null = Docker's default bridge
+  # with internet access, only to reproduce runs made before 2026-10-02.
+  network: patcheval-offline
 
 analysis:
   input_dir: null # Generation run, benchmark folder, or one archived task.

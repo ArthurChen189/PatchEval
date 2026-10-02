@@ -182,14 +182,16 @@ and caches. Keep these settings in an experiment YAML or use overrides:
 
 ```bash
 bash scripts/run.sh action=setup paths.runtime=/mnt/local/patcheval-local-llm
-bash scripts/run.sh action=serve paths.runtime=/mnt/local/patcheval-local-llm server.host=172.17.0.1
+bash scripts/run.sh action=serve paths.runtime=/mnt/local/patcheval-local-llm
 # In another terminal:
-bash scripts/run.sh action=check server.host=172.17.0.1
+bash scripts/run.sh action=check
 ```
 
 Setup creates `${paths.runtime}/venv-vllm`, leaving the previous SGLang `venv`
-untouched and reusing the configured Hugging Face cache. The explicit host above
-avoids Docker socket access during serving; generation still requires Docker.
+untouched and reusing the configured Hugging Face cache. With `server.host=null`
+the server binds the gateway of the agents' offline network (see "Offline agent
+containers"), creating that network if needed; an explicit `server.host` skips
+discovery, but agents can reach only an address on that network.
 New harness profiles use provider ID `vllm`; regenerate reusable profiles or
 update custom profiles yourself. `serve_sglang.sh` remains a deprecated forwarding
 alias to `serve_vllm.sh`.
@@ -201,7 +203,8 @@ benchmark smoke test remain pending until a server is explicitly started.
 `serve` stays in the foreground and forwards signals by replacing the launcher
 with vLLM. It records the installed serving version in `server-version.json`
 next to the resolved configuration. Redirect console output beneath `paths.runs`
-when a separate console log is needed. `server.host=null` discovers the Docker bridge gateway; port
+when a separate console log is needed. `server.host=null` discovers the gateway of
+`generation.network` (Docker's default bridge when that is null); port
 30000 is the default. Container localhost is not the host. For a different
 endpoint set `server.host`, `server.port`, or `server.base_url` (client URL,
 including `/v1`). `check.protocol=both|chat|responses` and `check.timeout=300`
@@ -458,6 +461,44 @@ Change `generation.concurrency` together with `server.data_parallel` and
 end-to-end verified dataset is unchanged; no new partition is introduced. An
 unsuccessful repair is not an infrastructure failure. Keep reference patches
 and fix metadata out of repair prompts and tools.
+
+### Offline agent containers
+
+Agent containers have no internet access (since 2026-10-02). An audit of the
+Qwen baselines found agents downloading upstream fixes, advisories, and fixed
+package versions (`analysis_reports/*-contamination-audit/`). Generation therefore:
+
+- runs every case container on `generation.network` (default `patcheval-offline`),
+  an internal Docker bridge with no internet route or external DNS. The runner
+  (`patch_agent_runner.py --network`, `AGENT_NETWORK` in `run_infer.sh`) refuses a
+  missing or non-internal network; Hydra creates it with
+  `docker network create --internal`. `serve` binds vLLM on its gateway, the only
+  host address agents can reach;
+- probes the network before each generation from the first dataset image and
+  writes `network-check.json` (model endpoint reachable, `1.1.1.1:443`, `pypi.org`
+  DNS and `:443` blocked); any internet route or unreachable model aborts the run;
+  `summary.json` records `network`/`network_internal`;
+- denies OpenCode's `webfetch`, `websearch`, and `codesearch` in the rendered
+  config (`"permission": {"*": "allow", ...: "deny"}`) and starts OpenCode with
+  `OPENCODE_DISABLE_MODELS_FETCH`, `_AUTOUPDATE`, `_DEFAULT_PLUGINS`,
+  `_LSP_DOWNLOAD`, and `_SHARE` (its startup downloads would otherwise wait on the
+  network; `OPENCODE_ENABLE_EXA` is unset); Codex keeps `web_search = "disabled"`,
+  and its unsandboxed shell is confined by the network.
+
+Behavior changes against earlier runs: agents can no longer `pip`/`npm`/`go`
+install packages missing from an image, and OpenCode no longer downloads LSP
+servers, so offline scores are not directly comparable with runs made before
+this change. `generation.network=null` (`AGENT_NETWORK=default` for the Bash
+runner) restores Docker's default bridge with internet access only to reproduce
+those runs; resumes of such invocations keep it. The evaluator's containers are
+unchanged: they never run the agent. Earlier reports were rescored on the CVEs no
+audited run had contaminated; see `analysis_reports/README.md`.
+
+`python -m scripts.infer.contamination_audit --run GENERATION_INVOCATION ... --out DIR`
+re-audits saved trajectories (upstream code of the target project, advisory pages,
+and installs of the target package), and `python -m scripts.infer.pass_at_k
+--restrict PASS_AT_K_JSON --exclude-cves FILE --out DIR` rescores an evaluation
+without the excluded CVEs.
 
 ### Token usage and cost inputs
 

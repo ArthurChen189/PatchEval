@@ -23,6 +23,11 @@ from typing import Any, Optional
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_AGENT_TIMEOUT_S = 2400
 STREAM_READER_LIMIT = 16 * 1024 * 1024
+# Agents run on an internal Docker network: it reaches the host (the model server
+# on its gateway) but has no internet route, so no tool can fetch upstream fixes.
+DEFAULT_AGENT_NETWORK = "patcheval-offline"
+# Docker's default bridge (internet access); only to reproduce earlier runs.
+ONLINE_NETWORK = "default"
 
 
 @dataclass
@@ -164,8 +169,12 @@ def _parse_mounts(items: list[str]) -> list[tuple[str, str, str]]:
     return mounts
 
 
-def _docker_run_args(container: str, image: str, result_dir: Path, mounts: list[tuple[str, str, str]]) -> list[str]:
-    cmd = ["docker", "run", "-d", "--name", container, "-v", f"{result_dir.resolve()}:/results:rw"]
+def _docker_run_args(container: str, image: str, result_dir: Path, mounts: list[tuple[str, str, str]],
+                     network: Optional[str] = None) -> list[str]:
+    cmd = ["docker", "run", "-d", "--name", container]
+    if network and network != ONLINE_NETWORK:
+        cmd.extend(["--network", network])
+    cmd.extend(["-v", f"{result_dir.resolve()}:/results:rw"])
     for host, dst, mode in mounts:
         cmd.extend(["-v", f"{host}:{dst}:{mode}"])
     cmd.extend([image, "bash", "-lc", "tail -f /dev/null"])
@@ -361,6 +370,22 @@ test -s /results/llm.patch
     return await _docker_exec(container, script, workdir=workdir, timeout_s=300)
 
 
+async def _check_network(name: str) -> dict[str, Any]:
+    """Refuse to start agents on a Docker network with an internet route."""
+    if name == ONLINE_NETWORK:
+        _log("WARNING: --network default gives agent containers internet access "
+             "(upstream fixes and advisories become reachable)")
+        return {"network": ONLINE_NETWORK, "network_internal": False}
+    result = await _run(["docker", "network", "inspect", name, "--format", "{{.Internal}}"], timeout_s=60)
+    if result.exit_code != 0:
+        raise ValueError(f"Docker network {name!r} not found; create it with "
+                         f"`docker network create --internal {name}` (action=serve/generate create it)")
+    if result.stdout.strip() != "true":
+        raise ValueError(f"Docker network {name!r} is not internal, so agents would have internet access; "
+                         "use an internal network (docker network create --internal)")
+    return {"network": name, "network_internal": True}
+
+
 async def _remove_container(container: str) -> None:
     await _run(["docker", "rm", "-f", container], timeout_s=120)
 
@@ -397,7 +422,8 @@ async def _run_one(sample: dict[str, Any], index: int, args: argparse.Namespace,
         try:
             env = {"PATCHAGENT_SESSION_ID": container}
             for attempt in range(1, attempts + 1):
-                run_result = await _run(_docker_run_args(container, image, work, mounts), timeout_s=1200)
+                run_result = await _run(_docker_run_args(container, image, work, mounts,
+                                                         getattr(args, "network", None)), timeout_s=1200)
                 if run_result.exit_code != 0:
                     raise RuntimeError(f"docker run failed: {run_result.stderr or run_result.stdout}")
                 workdir = await _detect_workdir(container, sample)
@@ -492,7 +518,8 @@ def _prepare_rerun(run_root: Path, selected: list[tuple[int, dict[str, Any]]]) -
     return rerun_dir
 
 
-def _merge_rerun(run_root: Path, rerun_dir: Path, results: list[GenerationResult]) -> list[dict[str, Any]]:
+def _merge_rerun(run_root: Path, rerun_dir: Path, results: list[GenerationResult],
+                 network: Optional[dict[str, Any]] = None) -> list[dict[str, Any]]:
     """Replace rerun cases' rows in place and recompute the run summary."""
     new = {r.cve: asdict(r) for r in results}
     rows = [json.loads(line) for line in (run_root / "results.jsonl").read_text(encoding="utf-8").splitlines()
@@ -502,11 +529,13 @@ def _merge_rerun(run_root: Path, rerun_dir: Path, results: list[GenerationResult
     partial.write_text("".join(json.dumps(row, ensure_ascii=False) + "\n" for row in merged), encoding="utf-8")
     partial.replace(run_root / "results.jsonl")
     generated = sum(bool(row.get("patch_generated")) for row in merged)
+    previous = _read_json(run_root / "summary.json") if (run_root / "summary.json").is_file() else {}
+    kept = {k: v for k, v in previous.items() if k in ("network", "network_internal")}
     _write_json(run_root / "summary.json", {"total": len(merged), "generated": generated,
-                                            "failed": len(merged) - generated})
+                                            "failed": len(merged) - generated, **kept})
     record = {"rerun_dir": str(rerun_dir), "cves": [r.cve for r in results],
               "generated": sum(r.patch_generated for r in results),
-              "startup_failed": sum(r.startup_failed for r in results)}
+              "startup_failed": sum(r.startup_failed for r in results), **(network or {})}
     with (run_root / "startup_reruns.jsonl").open("a", encoding="utf-8") as log:
         log.write(json.dumps(record) + "\n")
     return merged
@@ -517,6 +546,7 @@ async def _main(args: argparse.Namespace) -> int:
     samples = _read_json(input_path if input_path.is_absolute() else ROOT / input_path)
     selected = _select(samples, args)
     _require_dataset_images([sample for _, sample in selected])
+    network = await _check_network(getattr(args, "network", ONLINE_NETWORK))
     rerun_dir = None
     if args.rerun_into:
         run_root = Path(args.rerun_into).expanduser().resolve()
@@ -549,11 +579,12 @@ async def _main(args: argparse.Namespace) -> int:
             _log(f"progress {i}/{len(tasks)}: {result.cve} {result.status}")
     generated = sum(r.patch_generated for r in results)
     if rerun_dir:
-        merged = _merge_rerun(run_root, rerun_dir, results)
+        merged = _merge_rerun(run_root, rerun_dir, results, network)
         print(f"Reran {len(results)} cases in {run_root}: {generated} generated; "
               f"run now {sum(bool(r.get('patch_generated')) for r in merged)}/{len(merged)}")
     else:
-        _write_json(run_root / "summary.json", {"total": len(results), "generated": generated, "failed": len(results) - generated})
+        _write_json(run_root / "summary.json", {"total": len(results), "generated": generated,
+                                                "failed": len(results) - generated, **network})
         print(f"Run directory: {run_root}")
         print(f"Generated patches: {generated}/{len(results)}")
     return 0 if generated == len(results) else 1
@@ -570,6 +601,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--mount", action="append", default=[])
     p.add_argument("--agent-timeout", type=int, default=DEFAULT_AGENT_TIMEOUT_S)
     p.add_argument("--container-prefix", default="patcheval-agent")
+    p.add_argument("--network", default=DEFAULT_AGENT_NETWORK,
+                   help="Internal Docker network for agent containers (no internet route); "
+                        f"'{ONLINE_NETWORK}' uses Docker's bridge with internet access")
     p.add_argument("--save-trajectories", action="store_true",
                    help="Archive full task prompts, CLI streams, and configured native sessions")
     p.add_argument("--trajectory-path", type=_trajectory_spec, action="append", default=[],

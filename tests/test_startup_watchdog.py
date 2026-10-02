@@ -219,6 +219,7 @@ class ResumeRerunTests(unittest.TestCase):
             cfg.harness.binary = '/bin/true'
             with patch.object(workflow, 'run_command', side_effect=record), \
                  patch.object(workflow, 'record_harness_version', return_value={'version': '1.18.31'}), \
+                 patch.object(workflow, 'network_preflight'), \
                  patch('builtins.print'), patch('sys.stderr'):
                 workflow.dispatch(cfg, Path(tmp) / 'resume')
             self.assertEqual(calls[0]['RERUN_INTO'], str(run0))

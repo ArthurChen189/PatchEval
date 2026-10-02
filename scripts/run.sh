@@ -7,10 +7,10 @@
 #   bash scripts/run.sh action=setup paths.runtime=/mnt/local/patcheval-local-llm
 #
 # ▶️  Start Model Server:
-#   bash scripts/run.sh action=serve paths.runtime=/mnt/local/patcheval-local-llm server.host=172.17.0.1
+#   bash scripts/run.sh action=serve paths.runtime=/mnt/local/patcheval-local-llm   # binds the offline agents' network gateway
 #
 # 🔎  Check Server (run in a separate terminal):
-#   bash scripts/run.sh action=check server.host=172.17.0.1
+#   bash scripts/run.sh action=check
 #
 # 🧪  Generate Patches for Smoke Test:
 #   # Codex

@@ -57,6 +57,9 @@ case "${SAVE_TRAJECTORIES:-false}" in
   *) echo "SAVE_TRAJECTORIES must be true/false or 1/0" >&2; exit 2 ;;
 esac
 
+# Agent containers join AGENT_NETWORK, an internal Docker network with no internet
+# route (the runner refuses a non-internal one). "default" restores Docker's bridge
+# with internet access, only to reproduce runs made before offline agents.
 python "${SCRIPT_DIR}/patch_agent_runner.py" \
   --input "$DATASET" \
   --output-dir "$OUTPUT_BASE" \
@@ -69,4 +72,5 @@ python "${SCRIPT_DIR}/patch_agent_runner.py" \
   "${startup_args[@]}" \
   --agent-command "$AGENT_COMMAND" \
   --agent-timeout "${AGENT_TIMEOUT:-2400}" \
+  --network "${AGENT_NETWORK:-patcheval-offline}" \
   --container-prefix "patcheval-${AGENT}"
