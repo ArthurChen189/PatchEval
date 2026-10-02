@@ -12,14 +12,53 @@ PatchEval evaluates agent-generated vulnerability repairs in Docker environments
 
 Keep generation and evaluation separate. Generated artifacts default to `patcheval/exp_agent/agent_runs/`, including nested `eval_inputs/` and `evaluation_output/`, not alongside source files.
 
+### Architecture: three layers
+
+Changes usually touch one layer; keep the lower layers' interfaces stable.
+
+1. **Hydra orchestrator**: `scripts/run.py`, launched through `scripts/run.sh` under
+   `uv`. `dispatch()` branches on `action` (`setup|serve|configure|check|generate|evaluate|analyze`).
+   It composes `scripts/conf/`, validates it, names the invocation folder
+   (`run_group`/`run_name` resolvers), renders harness homes
+   (`scripts/infer/configure_harnesses.py`), and records `resolved.yaml`,
+   `server.json`, and `harness-version.json`. It then **shells out** to layer 2
+   through environment variables (`OUTPUT_BASE`, `CODEX_BIN`, `RERUN_INTO`, ...).
+   Multi-sample generation, resume and startup reruns, server-metrics snapshots,
+   pass@k (`scripts/infer/pass_at_k.py`), and token accounting
+   (`scripts/infer/token_usage.py`) all live in this layer. The Python helpers in
+   `scripts/infer/` are thin Hydra aliases or stdlib tools that can also be run
+   with `python -m scripts.infer.<name>`.
+2. **Generation runner**: `patcheval/exp_agent/run_infer.sh <agent> [prefix]` sources
+   `agents/<agent>.sh`. That script sets `AGENT_MOUNTS`, `AGENT_EXTRA_ARGS`,
+   `AGENT_READY_PATTERN`, and `AGENT_TRAJECTORY_PATHS`, and enforces the pins through
+   `pinned_harness.sh`. `run_infer.sh` then calls `patch_agent_runner.py`, an asyncio
+   runner that starts one container per CVE from the dataset's `image_url`. It
+   mounts the harness read-only, runs the agent under the timeout and startup
+   watchdog, and collects the working-tree diff as the patch. It writes
+   `results.jsonl`, `summary.json`, `patches/`, and optionally `trajectories/`. A
+   run directory is complete once it contains `summary.json`.
+3. **Evaluation**: `patcheval/exp_agent/process_data.py` converts a run into
+   evaluator input. `patcheval/evaluation/run_evaluation.py` (`DockerManager`,
+   `Evaluation`) applies each patch in the case image and runs the case's tests.
+   `action=evaluate` runs both steps for each sample.
+
+The local vLLM endpoint (`scripts/infer/serve_vllm.sh`, `check_server.py`) is
+reached from containers through the Docker bridge gateway. Pinned harness binaries
+are stored under `third_party/` as Git LFS `.xz` archives, which are extracted and
+checksum-verified on first use. The pins are duplicated in
+`scripts/conf/harness/*.yaml` and `patcheval/exp_agent/agents/*.sh`;
+`tests/test_pinned_harness.py` checks that they match.
+
 ## Build, Test, and Development Commands
 
 Use Linux, Python 3.10+ (3.12 recommended), and an accessible Docker daemon. There is no separate build step. Activate your Python environment first.
 
 From the repository root:
 
-- `pip install -r requirements.txt`: install runtime dependencies.
-- `python -m unittest discover -s tests -v`: run unit tests.
+- `pip install -r requirements.txt` (or `uv sync`; the repo's `.venv` is uv-managed): install runtime dependencies.
+- `python -m unittest discover -s tests -v`: run unit tests (no Docker or GPU; about 15 s).
+- `python -m unittest tests.test_pass_at_k.PassAtKTests.test_unbiased_estimator`: run one test (or pass a module/class).
+- `bash scripts/run.sh --cfg job --resolve ...` and `... dry_run=true`: validate workflow changes without Docker or GPUs.
 - `(cd scripts && python download_images.py)`: pull all benchmark images; reserve at least 500 GB for the full collection.
 
 For a one-case integration smoke test, configure the agent executable and credentials as described in `patcheval/exp_agent/README.md`, then run:
