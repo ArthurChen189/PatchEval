@@ -446,9 +446,8 @@ OpenCode receives its expected XDG config/data layout. The integration was
 checked with Codex 0.154.0, 0.155.0, and 0.155.1 and OpenCode 1.18.31. Both
 harnesses are pinned so every run uses the same agent: the official release
 binaries are vendored under `third_party/` with their licenses, `SHA256SUMS`, and
-a provenance README, as xz archives stored with Git LFS
-(`third_party/**/*.xz`; install `git-lfs` and run `git lfs install` before
-cloning or pushing):
+a provenance README, as xz archives committed as plain git blobs (`.gitattributes` is
+empty, so no Git LFS is involved; the extracted executables are git-ignored):
 
 - Codex 0.155.0: `third_party/codex/0.155.0/codex-x86_64-unknown-linux-musl.xz`
   (static musl build, Apache-2.0), identical to the `rust-v0.155.0` asset.

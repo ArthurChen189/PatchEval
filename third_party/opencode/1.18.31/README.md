@@ -13,7 +13,7 @@ were validated against it.
   recompressed with `xz -9e`; it is byte-identical after decompression.
 - `SHA256SUMS` lists the compressed file and the decompressed binary.
 
-The archive is stored with Git LFS. Generation extracts the binary next to the
+The archive is committed as a plain git blob (no Git LFS). Generation extracts the binary next to the
 archive on first use and verifies both checksums; the extracted file is
 git-ignored. To extract it manually:
 

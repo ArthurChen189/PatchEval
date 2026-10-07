@@ -12,7 +12,7 @@ agent, independent of the self-updating standalone install on the host.
   (asset sha256 `2a72d3352f5eb9a58a60269eb3338fc5a8bdb8805e3dec2dfaa94f4569941613`).
 - `SHA256SUMS` lists the compressed file and the decompressed binary.
 
-The archive is stored with Git LFS. Generation extracts the binary next to the archive on first use and verifies
+The archive is committed as a plain git blob (no Git LFS). Generation extracts the binary next to the archive on first use and verifies
 both checksums; the extracted file is git-ignored. To extract it manually:
 
 ```bash
