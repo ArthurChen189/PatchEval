@@ -57,6 +57,15 @@ case "${SAVE_TRAJECTORIES:-false}" in
   *) echo "SAVE_TRAJECTORIES must be true/false or 1/0" >&2; exit 2 ;;
 esac
 
+# Python images keep project dependencies only in a virtualenv inside the evaluation payload;
+# PYTHON_ENV=true (default) moves it where the agent can use it before the payload is hidden.
+python_env_args=()
+case "${PYTHON_ENV:-true}" in
+  true|1) python_env_args+=(--python-env) ;;
+  false|0) python_env_args+=(--no-python-env) ;;
+  *) echo "PYTHON_ENV must be true/false or 1/0" >&2; exit 2 ;;
+esac
+
 # Agent containers join AGENT_NETWORK, an internal Docker network with no internet
 # route (the runner refuses a non-internal one). "default" restores Docker's bridge
 # with internet access, only to reproduce runs made before offline agents.
@@ -70,6 +79,7 @@ python "${SCRIPT_DIR}/patch_agent_runner.py" \
   "${AGENT_EXTRA_ARGS[@]}" \
   "${trajectory_args[@]}" \
   "${startup_args[@]}" \
+  "${python_env_args[@]}" \
   --agent-command "$AGENT_COMMAND" \
   --agent-timeout "${AGENT_TIMEOUT:-2400}" \
   --network "${AGENT_NETWORK:-patcheval-offline}" \

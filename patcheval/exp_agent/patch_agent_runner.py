@@ -15,6 +15,7 @@ import re
 import shlex
 import shutil
 import time
+from collections import Counter
 import tempfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -28,6 +29,77 @@ STREAM_READER_LIMIT = 16 * 1024 * 1024
 DEFAULT_AGENT_NETWORK = "patcheval-offline"
 # Docker's default bridge (internet access); only to reproduce earlier runs.
 ONLINE_NETWORK = "default"
+
+# Python images install the project's dependencies only in a virtualenv under
+# /workspace/PoC_env/<CVE>/, which _hide_workspace_payload would delete with the rest of the
+# evaluation payload. Before that, this script moves the venv to PE_DEST (also hiding the CVE id
+# in its directory name), rewrites the old path in its scripts, checks that it still works, and
+# writes an env file that puts it first on PATH. It prints key=value lines; status is one of
+# relocated, none (no venv), ambiguous, unsupported, or broken (removed; agent gets none).
+# A raw string: no format() braces. Inputs come from the environment so tests can run it locally.
+PYTHON_ENV_SCRIPT = r'''
+set -u
+ws=${PE_WORKSPACE:-/workspace}
+dest=${PE_DEST:-/opt/project-venv}
+envfile=${PE_ENV_FILE:-/etc/profile.d/zz-project-venv.sh}
+cve=${CVE:-}
+cfgs=()
+if [ -n "$cve" ] && [ -f "$ws/PoC_env/$cve/pyvenv.cfg" ]; then
+  cfgs=("$ws/PoC_env/$cve/pyvenv.cfg")
+else
+  for f in "$ws"/PoC_env/*/pyvenv.cfg; do [ -f "$f" ] && cfgs+=("$f"); done
+fi
+if [ "${#cfgs[@]}" -eq 0 ]; then echo status=none; exit 0; fi
+if [ "${#cfgs[@]}" -gt 1 ]; then echo status=ambiguous; exit 0; fi
+src=$(dirname "${cfgs[0]}")
+name=$(basename "$src")
+home=$(sed -n 's/^home *= *//p' "$src/pyvenv.cfg" | head -n 1)
+case "$home" in "$ws"|"$ws"/*) echo status=unsupported; echo reason=home-in-workspace; exit 0;; esac
+if [ -e "$dest" ]; then echo status=unsupported; echo reason=destination-exists; exit 0; fi
+probe() { "$1/bin/python" -c 'import sys; print(sys.path)' 2>/dev/null; }
+if ! before=$(probe "$src"); then echo status=unsupported; echo reason=python-fails-in-place; exit 0; fi
+start=$(date +%s)
+mkdir -p "$dest" || { echo status=unsupported; echo reason=mkdir-failed; exit 0; }
+skipped=""
+for entry in "$src"/* "$src"/.[!.]*; do
+  [ -e "$entry" ] || [ -L "$entry" ] || continue
+  base=$(basename "$entry")
+  case "$base" in
+    pyvenv.cfg|bin|lib|lib64|include|share|etc|src|man|LICENSE|LICENSE.txt|.gitignore|pip-selfcheck.json)
+      mv "$entry" "$dest/" || { echo status=error; echo reason=move-failed; exit 1; } ;;
+    *) skipped="$skipped$base," ;;
+  esac
+done
+# Compiled bytecode embeds the old source paths; Python regenerates it on import.
+find "$dest" -name '*.pyc' -type f -delete 2>/dev/null
+find "$dest" -name __pycache__ -type d -empty -delete 2>/dev/null
+esc() { printf '%s' "$1" | sed 's/[][\.*^$#/]/\\&/g'; }
+old=$(esc "$src"); new=$(esc "$dest"); bare=$(esc "$name")
+rewritten=0
+for f in "$dest/pyvenv.cfg" "$dest"/bin/*; do
+  [ -f "$f" ] && [ ! -L "$f" ] || continue
+  grep -Iq . "$f" 2>/dev/null || continue
+  grep -q -- "$name" "$f" || continue
+  sed -i -e "s#$old#$new#g" -e "s#$bare#project-venv#g" "$f" && rewritten=$((rewritten + 1))
+done
+# The moved interpreter must see the same import path as before, with the old location mapped.
+after=$(probe "$dest") || after="<failed>"
+if [ "$after" != "${before//"$src"/"$dest"}" ]; then
+  rm -rf "$dest"
+  echo status=broken
+  exit 0
+fi
+leaks=$( { grep -rlI -- "$name" "$dest/bin" "$dest/pyvenv.cfg" 2>/dev/null;
+           grep -lI -- "$name" "$dest"/lib/python*/site-packages/*.pth "$dest"/lib/python*/site-packages/*.egg-link 2>/dev/null; } | wc -l)
+mkdir -p "$(dirname "$envfile")"
+printf 'export VIRTUAL_ENV=%s\nexport PATH="%s/bin:$PATH"\nunset PYTHONHOME\n' "$dest" "$dest" > "$envfile.tmp" && mv -f "$envfile.tmp" "$envfile"
+echo status=relocated
+echo seconds=$(( $(date +%s) - start ))
+echo rewritten=$rewritten
+echo leaks=$leaks
+echo skipped=$skipped
+'''
+PYTHON_ENV_FILE = "/etc/profile.d/zz-project-venv.sh"
 
 
 @dataclass
@@ -60,6 +132,10 @@ class GenerationResult:
     trajectory_path: Optional[str] = None
     startup_attempts: int = 1
     startup_failed: bool = False
+    # Status of the project Python environment (see PYTHON_ENV_SCRIPT); None when not prepared.
+    python_env: Optional[str] = None
+    # Continue-on-length record written by the agent wrapper; None when not used.
+    continuations: Optional[int] = None
 
 
 def _safe_name(value: str, max_len: int = 100) -> str:
@@ -222,6 +298,16 @@ async def _detect_workdir(container: str, sample: dict[str, Any]) -> str:
     return "/workspace"
 
 
+async def _prepare_python_env(container: str, cve: str) -> dict[str, str]:
+    """Keep the project's Python virtualenv usable after the payload is hidden (PYTHON_ENV_SCRIPT)."""
+    result = await _docker_exec(container, f"CVE={shlex.quote(cve)}\n" + PYTHON_ENV_SCRIPT, timeout_s=1200)
+    if result.exit_code != 0 or result.timed_out:
+        raise RuntimeError(f"preparing the project Python environment failed: {result.stderr or result.stdout}")
+    fields = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
+    fields.setdefault("status", "none")
+    return fields
+
+
 async def _hide_workspace_payload(container: str, workdir: str, session_key: str) -> None:
     if workdir.rstrip("/") == "/workspace":
         result = await _docker_exec(container, "rm -f /workspace/fix.patch", timeout_s=300)
@@ -336,10 +422,13 @@ async def _archive_trajectory(container: str, work: Path, destination: Path,
     destination.mkdir(parents=True, exist_ok=True)
     capture: dict[str, Any] = {"native": {}, "warnings": []}
     for source, target in (("prompt.txt", "prompt.txt"), ("agent_stdout.txt", "stdout.jsonl"),
-                           ("agent_stderr.txt", "stderr.txt")):
+                           ("agent_stderr.txt", "stderr.txt"), ("continuations.json", "continuations.json")):
         path = work / source
         if path.exists():
             shutil.copyfile(path, destination / target)
+    # Patches as they stood at each output-limit stop (written by the continue-on-length wrapper).
+    for path in sorted(work.glob("length_stop_*.patch")):
+        shutil.copyfile(path, destination / path.name)
     stopped = await _run(["docker", "stop", "--time", "5", container], timeout_s=30)
     if stopped.exit_code != 0:
         capture["warnings"].append("Container stop failed; native session files may be incomplete: " + stopped.stderr)
@@ -419,20 +508,35 @@ async def _run_one(sample: dict[str, Any], index: int, args: argparse.Namespace,
         attempts = 1 + (int(getattr(args, "startup_retries", 0)) if watchdog else 0)
         stalls: list[dict[str, Any]] = []
         startup_failed = False
+        python_env: Optional[dict[str, str]] = None
+        continuations: Optional[dict[str, Any]] = None
         try:
-            env = {"PATCHAGENT_SESSION_ID": container}
+            # A neutral id: the container name contains the CVE id, which the prompt does not reveal.
+            env = {"PATCHAGENT_SESSION_ID": f"agent-{os.getpid()}-{index}"}
             for attempt in range(1, attempts + 1):
                 run_result = await _run(_docker_run_args(container, image, work, mounts,
                                                          getattr(args, "network", None)), timeout_s=1200)
                 if run_result.exit_code != 0:
                     raise RuntimeError(f"docker run failed: {run_result.stderr or run_result.stdout}")
                 workdir = await _detect_workdir(container, sample)
+                if getattr(args, "python_env", False):
+                    try:
+                        python_env = await _prepare_python_env(container, cve)
+                    except Exception:
+                        # No model output exists yet, so a resume may rerun this task.
+                        startup_failed = True
+                        raise
                 await _hide_workspace_payload(container, workdir, container)
                 prompt = _prompt(sample, workdir)
                 (work / "prompt.txt").write_text(prompt, encoding="utf-8")
+                for stale in [work / "continuations.json", *work.glob("length_stop_*.patch")]:
+                    stale.unlink(missing_ok=True)
                 watch = ({"ready_pattern": ready_pattern, "startup_timeout": startup_timeout}
                          if watchdog else {})
-                agent_result = await _run_agent(container, workdir, args.agent_command, work, env,
+                command = args.agent_command
+                if python_env and python_env.get("status") == "relocated":
+                    command = f". {PYTHON_ENV_FILE}; " + command
+                agent_result = await _run_agent(container, workdir, command, work, env,
                                                 args.agent_timeout, **watch)
                 if not agent_result.startup_stalled:
                     break
@@ -452,6 +556,11 @@ async def _run_one(sample: dict[str, Any], index: int, args: argparse.Namespace,
                      f"(attempt {attempt}/{attempts}); retrying in a fresh container")
                 await _remove_container(container)
             timed_out = agent_result.timed_out
+            if (work / "continuations.json").is_file():
+                try:
+                    continuations = _read_json(work / "continuations.json")
+                except (OSError, ValueError):
+                    continuations = {"error": "unreadable continuations.json"}
             if agent_result.exit_code != 0:
                 raise RuntimeError(f"agent failed with exit_code={agent_result.exit_code}")
             collect = await _collect_patch(container, workdir, work)
@@ -479,11 +588,15 @@ async def _run_one(sample: dict[str, Any], index: int, args: argparse.Namespace,
                                   timed_out, time.monotonic() - started, str(patch_path), error,
                                   str(trajectory) if trajectory else None,
                                   startup_attempts=len(stalls) + (0 if startup_failed else 1),
-                                  startup_failed=startup_failed)
+                                  startup_failed=startup_failed,
+                                  python_env=python_env.get("status") if python_env else None,
+                                  continuations=(int(continuations.get("continuations", 0))
+                                                 if continuations and "error" not in continuations else None))
         if trajectory:
             _write_json(trajectory / "metadata.json", {"schema_version": 1, **asdict(result),
                         "capture": capture, "work_logs": str(work), "startup_stalls": stalls,
-                        "agent_duration_s": agent_result.duration_s if agent_result else None})
+                        "agent_duration_s": agent_result.duration_s if agent_result else None,
+                        "python_env_detail": python_env, "continuation_record": continuations})
         return result
 
 
@@ -518,6 +631,19 @@ def _prepare_rerun(run_root: Path, selected: list[tuple[int, dict[str, Any]]]) -
     return rerun_dir
 
 
+def _summary_extras(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Counts for optional agent-environment features; empty when none was used."""
+    extras: dict[str, Any] = {}
+    statuses = [row.get("python_env") for row in rows if row.get("python_env") is not None]
+    if statuses:
+        extras["python_env"] = dict(sorted(Counter(statuses).items()))
+    counts = [row.get("continuations") for row in rows if row.get("continuations") is not None]
+    if counts:
+        extras["continued_tasks"] = sum(1 for n in counts if n)
+        extras["continuations"] = sum(counts)
+    return extras
+
+
 def _merge_rerun(run_root: Path, rerun_dir: Path, results: list[GenerationResult],
                  network: Optional[dict[str, Any]] = None) -> list[dict[str, Any]]:
     """Replace rerun cases' rows in place and recompute the run summary."""
@@ -532,7 +658,8 @@ def _merge_rerun(run_root: Path, rerun_dir: Path, results: list[GenerationResult
     previous = _read_json(run_root / "summary.json") if (run_root / "summary.json").is_file() else {}
     kept = {k: v for k, v in previous.items() if k in ("network", "network_internal")}
     _write_json(run_root / "summary.json", {"total": len(merged), "generated": generated,
-                                            "failed": len(merged) - generated, **kept})
+                                            "failed": len(merged) - generated, **kept,
+                                            **_summary_extras(merged)})
     record = {"rerun_dir": str(rerun_dir), "cves": [r.cve for r in results],
               "generated": sum(r.patch_generated for r in results),
               "startup_failed": sum(r.startup_failed for r in results), **(network or {})}
@@ -584,7 +711,8 @@ async def _main(args: argparse.Namespace) -> int:
               f"run now {sum(bool(r.get('patch_generated')) for r in merged)}/{len(merged)}")
     else:
         _write_json(run_root / "summary.json", {"total": len(results), "generated": generated,
-                                                "failed": len(results) - generated, **network})
+                                                "failed": len(results) - generated, **network,
+                                                **_summary_extras([asdict(r) for r in results])})
         print(f"Run directory: {run_root}")
         print(f"Generated patches: {generated}/{len(results)}")
     return 0 if generated == len(results) else 1
@@ -618,6 +746,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="File of CVE IDs to run (one per line); keeps their dataset indices and ignores --limit")
     p.add_argument("--rerun-into", default="",
                    help="Existing run directory whose selected cases are rerun and replaced in place")
+    p.add_argument("--python-env", action=argparse.BooleanOptionalAction, default=True,
+                   help="Keep the project's Python virtualenv usable by the agent (moved out of the hidden payload)")
     return p
 
 

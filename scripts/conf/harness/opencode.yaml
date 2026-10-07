@@ -10,3 +10,10 @@ config: null
 # Optional rules/skills profile: <dir>/config/ is copied into the rendered OpenCode
 # config directory (e.g. harness=opencode_secpatch). null renders the plain config.
 profile: null
+# OpenCode's grep, glob, and skill tools need ripgrep, which OpenCode downloads on first use;
+# offline agent containers cannot, so this pinned static binary is mounted at /usr/local/bin/rg
+# (third_party/ripgrep/15.1.0/README.md). null reproduces runs made before 2026-10-06.
+ripgrep: ${repo:}/third_party/ripgrep/15.1.0/rg
+# Continue a session up to this many times when a response ends at the output-token limit
+# before calling a tool (patcheval/exp_agent/container/opencode_continue.sh). 0 = off.
+continue_on_length: 0

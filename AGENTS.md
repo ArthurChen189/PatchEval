@@ -44,8 +44,9 @@ Changes usually touch one layer; keep the lower layers' interfaces stable.
 
 The local vLLM endpoint (`scripts/infer/serve_vllm.sh`, `check_server.py`) is
 reached from containers through the Docker bridge gateway. Pinned harness binaries
-are stored under `third_party/` as Git LFS `.xz` archives, which are extracted and
-checksum-verified on first use. The pins are duplicated in
+(and the ripgrep that OpenCode's tools need) are stored under `third_party/` as `.xz`
+archives (plain git blobs, not Git LFS), which are extracted and checksum-verified on
+first use. The pins are duplicated in
 `scripts/conf/harness/*.yaml` and `patcheval/exp_agent/agents/*.sh`;
 `tests/test_pinned_harness.py` checks that they match.
 
@@ -556,6 +557,48 @@ and deepsec (Apache-2.0), stored in `harness_profiles/opencode/secpatch/` (see i
 - **New profiles.** Add a directory with a `config/` tree and a harness YAML with `defaults: [opencode, _self_]`
   and `profile: ${repo:}/harness_profiles/opencode/<name>`.
 - **Outside PatchEval** (for example CWEBench), copy `config/` into the agent's `$XDG_CONFIG_HOME/opencode/`.
+  reproducibility.
+
+### Agent environment: ripgrep, project Python env, continue-on-length (2026-10-06)
+
+An analysis of the offline val46 runs found three harness defects that affected every harness. These are fixed
+by default; each has an opt-out to reproduce older runs.
+
+- **ripgrep.** OpenCode's `grep`, `glob`, and `skill` tools run ripgrep and download it on first use. Offline,
+  every call failed ("ripgrep execution failed"), so the v1 skill tool never loaded.
+  - The official static `ripgrep-15.1.0-x86_64-unknown-linux-musl` (the asset OpenCode itself downloads) is
+    vendored in `third_party/ripgrep/15.1.0/`.
+  - It is mounted read-only at `/usr/local/bin/rg` in OpenCode containers.
+  - Settings: `harness.ripgrep`, or `RIPGREP_BIN` for `run_infer.sh`; `null`/`none` turns it off. It is pinned
+    and checksum-verified like the harness binaries.
+- **Project Python environment.** Python images install dependencies only in `/workspace/PoC_env/<CVE>/`, which
+  the payload hiding deleted. Python agents therefore could not run project tests.
+  - The runner (`PYTHON_ENV_SCRIPT`, `--python-env`) now moves that venv to `/opt/project-venv` before hiding
+    the payload. This also hides the CVE id.
+  - It rewrites the old path in `bin/` and `pyvenv.cfg`, and verifies that `sys.path` is unchanged after the
+    move. It then writes `/etc/profile.d/zz-project-venv.sh`, which the agent command sources first.
+  - Status (`relocated`/`none`/`ambiguous`/`unsupported`/`broken`) is recorded per task (`python_env`) and
+    counted in `summary.json`. A failure is a startup failure, which a resume reruns.
+  - Large venvs take up to about 100 s to move (the overlayfs copy), before the agent's clock starts.
+  - The setting is `generation.python_env` (`PYTHON_ENV` for `run_infer.sh`). A resumed invocation keeps its
+    stored value (false if absent).
+  - `PATCHAGENT_SESSION_ID` no longer contains the container name, which carried the CVE id.
+- **Continue on length.** A response that spends the whole output budget on reasoning ends with
+  `step_finish.reason == "length"` and no tool call, and OpenCode 1.18.31 then exits. Every empty patch in the
+  offline val46 runs had this cause.
+  - `harness.continue_on_length: N` (OpenCode only, default 0; `opencode_secpatch2` sets 2) mounts
+    `patcheval/exp_agent/container/opencode_continue.sh`.
+  - The wrapper reruns `opencode run -s <session>` up to N times with a fixed, task-neutral nudge on stdin. Each
+    continuation has a 300 s startup watchdog with 2 retries. Opencode's exit status passes through, and all
+    runs share the agent timeout.
+  - At each length stop it snapshots the would-be patch (`length_stop_<n>.patch`) and records
+    `continuations.json`. Both are copied to the trajectory, and `continuations` goes into `results.jsonl`, so
+    each run also yields its no-continuation outcome.
+  - With 0, the agent command is byte-identical to before.
+- **Provenance.** Each generation writes `agent-environment.json`: the ripgrep path and sha, `python_env`,
+  `continue_on_length`, and the wrapper sha. A resume refuses if it changed.
+- **Comparability.** Runs made with these fixes are not directly comparable with earlier runs. Rerun baselines
+  with the same settings.
 
 ### Token usage and cost inputs
 

@@ -64,6 +64,10 @@ generation:
   # missing; a non-internal network is refused. null = Docker's default bridge
   # with internet access, only to reproduce runs made before 2026-10-02.
   network: patcheval-offline
+  # Python images keep project dependencies only in a virtualenv inside the hidden
+  # evaluation payload; true moves it to /opt/project-venv (first on PATH) so agents can
+  # run the project's tests. false reproduces runs made before 2026-10-06.
+  python_env: true
 
 analysis:
   input_dir: null # Generation run, benchmark folder, or one archived task.

@@ -181,6 +181,15 @@ def validate(cfg):
         if not OmegaConf.is_dict(speculative) or not isinstance(speculative.get("method"), str):
             raise ValueError("server.speculative must be null or a mapping with a method")
         positive(speculative.get("num_speculative_tokens"), "server.speculative.num_speculative_tokens")
+    if not isinstance(cfg.generation.get("python_env", False), bool):
+        raise ValueError("generation.python_env must be a boolean")
+    if cfg.harness.get("ripgrep") is not None and cfg.harness.name != "opencode":
+        raise ValueError("harness.ripgrep applies only to opencode")
+    continue_on_length = cfg.harness.get("continue_on_length", 0)
+    if isinstance(continue_on_length, bool) or not isinstance(continue_on_length, int) or continue_on_length < 0:
+        raise ValueError("harness.continue_on_length must be a non-negative integer")
+    if continue_on_length and cfg.harness.name != "opencode":
+        raise ValueError("harness.continue_on_length applies only to opencode")
     profile = cfg.harness.get("profile")
     if profile is not None:
         if cfg.harness.name != "opencode" or cfg.harness.config:
@@ -519,8 +528,55 @@ def generation_job(cfg, output, harness_home=None):
            "LIMIT": str(cfg.generation.limit), "CONCURRENCY": str(cfg.generation.concurrency),
            "AGENT_TIMEOUT": str(cfg.generation.timeout),
            "AGENT_NETWORK": agent_network(cfg) or "default",
-           "SAVE_TRAJECTORIES": str(cfg.generation.save_trajectories).lower()}
+           "SAVE_TRAJECTORIES": str(cfg.generation.save_trajectories).lower(),
+           **agent_environment(cfg)}
     return ["bash", str(ROOT / "patcheval/exp_agent/run_infer.sh"), cfg.harness.name, cfg.label], env
+
+
+def agent_environment(cfg):
+    """Adapter variables for optional agent-environment features, always exported.
+
+    The Bash adapters default these features on, so ambient shell values or a resumed
+    invocation that predates a feature must never switch one on implicitly.
+    """
+    ripgrep = cfg.harness.get("ripgrep") if cfg.harness.name == "opencode" else None
+    env = {"RIPGREP_BIN": "none",
+           "OPENCODE_CONTINUE_ON_LENGTH": str(cfg.harness.get("continue_on_length") or 0),
+           "PYTHON_ENV": str(bool(cfg.generation.get("python_env", False))).lower()}
+    if ripgrep:
+        path = absolute(ripgrep)
+        if not cfg.dry_run:
+            ensure_vendored_binary(path)
+            if not os.access(path, os.X_OK):
+                raise ValueError(f"harness.ripgrep is not executable: {path}")
+        env["RIPGREP_BIN"] = str(path)
+    return env
+
+
+CONTINUE_WRAPPER = ROOT / "patcheval/exp_agent/container/opencode_continue.sh"
+
+
+def record_agent_environment(env, output):
+    """Record the agent-environment features of a generation beside its resolved config."""
+    def digest(path):
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    ripgrep = env.get("RIPGREP_BIN", "none")
+    continue_on_length = int(env.get("OPENCODE_CONTINUE_ON_LENGTH", "0") or 0)
+    record = {"python_env": env.get("PYTHON_ENV") == "true",
+              "ripgrep": None if ripgrep == "none" else {"path": ripgrep, "sha256": digest(ripgrep)},
+              "continue_on_length": continue_on_length,
+              "continue_wrapper_sha256": digest(CONTINUE_WRAPPER) if continue_on_length else None}
+    (output / "agent-environment.json").write_text(json.dumps(record, indent=2) + "\n")
+    return record
+
+
+def check_resume_environment(target, record):
+    stored = target / "agent-environment.json"
+    if stored.is_file():
+        previous = json.loads(stored.read_text())
+        if previous != record:
+            raise ValueError(f"Agent environment changed since {target} was generated "
+                             f"({previous} -> {record}); restore it to keep samples comparable")
 
 
 def record_harness_version(cfg, binary, output):
@@ -674,6 +730,8 @@ def prepare_resume(cfg, output):
     # Invocations made before offline agents recorded no network: they ran on
     # Docker's default bridge, so their remaining samples do too.
     OmegaConf.update(cfg, "generation.network", stored.generation.get("network"))
+    # Invocations made before the project Python environment was kept ran without it.
+    OmegaConf.update(cfg, "generation.python_env", bool(stored.generation.get("python_env", False)))
     if stored.generation.get("network") is None:
         print(f"WARNING: {target} was generated with internet access; resumed samples keep it "
               "for comparability", file=sys.stderr, flush=True)
@@ -855,10 +913,12 @@ def dispatch(cfg, output):
         if not cfg.dry_run:
             record = record_harness_version(cfg, env[f"{prefix}_BIN"], output)
             server = record_server(cfg, output)
+            agent_env = record_agent_environment(env, output)
             network_preflight(cfg, output)
             if target != output:
                 check_resume_version(target, record)
                 check_resume_server(target, server)
+                check_resume_environment(target, agent_env)
         # Independent samples for pass@k run one after another against the same
         # server and harness config, each in its own generation/sample_<i>/.
         samples = cfg.generation.samples
