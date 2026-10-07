@@ -87,13 +87,19 @@ def cap_label(tokens):
     return str(tokens)
 
 
-def group_name(model, harness, output_tokens):
-    """Results folder for one model x harness x output cap, e.g. Qwen3.8-27B_Codex_Max-output-token=16k."""
+def group_name(model, harness, output_tokens, profile=None):
+    """Results folder for one model x harness x output cap, e.g. Qwen3.8-27B_Codex_Max-output-token=16k.
+
+    An OpenCode profile is part of the harness, e.g. Qwen3.8-27B_OpenCode-secpatch_Max-output-token=16k.
+    """
     model = Path(str(model)).name
-    return f"{model}_{HARNESS_TITLES.get(str(harness), str(harness))}_Max-output-token={cap_label(output_tokens)}"
+    title = HARNESS_TITLES.get(str(harness), str(harness))
+    if profile:
+        title += f"-{Path(str(profile)).name}"
+    return f"{model}_{title}_Max-output-token={cap_label(output_tokens)}"
 
 
-def run_group(runs, action, model, harness, output_tokens, run_dir=None, resume_dir=None):
+def run_group(runs, action, model, harness, output_tokens, run_dir=None, resume_dir=None, profile=None):
     """Folder beneath paths.runs that an invocation belongs to.
 
     Serving is shared by all harnesses. Evaluations and resumes join the group of
@@ -110,8 +116,9 @@ def run_group(runs, action, model, harness, output_tokens, run_dir=None, resume_
         stored = OmegaConf.load(invocation / "resolved.yaml")
         if OmegaConf.select(stored, "harness.name") and OmegaConf.select(stored, "model.output_tokens"):
             return group_name(OmegaConf.select(stored, "model.served_name") or model,
-                              stored.harness.name, stored.model.output_tokens)
-    return group_name(model, harness, output_tokens)
+                              stored.harness.name, stored.model.output_tokens,
+                              OmegaConf.select(stored, "harness.profile"))
+    return group_name(model, harness, output_tokens, profile)
 
 
 OmegaConf.register_new_resolver("run_group", run_group, replace=True)
@@ -121,6 +128,12 @@ OmegaConf.register_new_resolver("run_name", run_name, replace=True)
 def positive(value, name):
     if isinstance(value, bool) or not isinstance(value, int) or value < 1:
         raise ValueError(f"{name} must be a positive integer")
+
+
+def opencode_profile(cfg):
+    """Absolute path of the OpenCode profile (rules and skills) to render, or None."""
+    profile = cfg.harness.get("profile")
+    return None if profile is None or cfg.harness.name != "opencode" else absolute(profile)
 
 
 def validate(cfg):
@@ -168,6 +181,12 @@ def validate(cfg):
         if not OmegaConf.is_dict(speculative) or not isinstance(speculative.get("method"), str):
             raise ValueError("server.speculative must be null or a mapping with a method")
         positive(speculative.get("num_speculative_tokens"), "server.speculative.num_speculative_tokens")
+    profile = cfg.harness.get("profile")
+    if profile is not None:
+        if cfg.harness.name != "opencode" or cfg.harness.config:
+            raise ValueError("harness.profile applies only to opencode with rendered configs (harness.config=null)")
+        if not (absolute(profile) / "config").is_dir():
+            raise ValueError(f"harness.profile has no config/ directory: {absolute(profile)}")
     slots = cfg.server.data_parallel * cfg.server.max_running_requests
     if cfg.action == "generate" and cfg.generation.concurrency > slots:
         print(f"WARNING: generation.concurrency={cfg.generation.concurrency} exceeds the server's "
@@ -485,7 +504,8 @@ def generation_job(cfg, output, harness_home=None):
         url = endpoint(cfg)
         if not cfg.dry_run and harness_home is None:
             configure(home, url, cfg.model.served_name, cfg.model.context_length,
-                      output_tokens=cfg.model.output_tokens, temperature=cfg.model.get("temperature"))
+                      output_tokens=cfg.model.output_tokens, temperature=cfg.model.get("temperature"),
+                      opencode_profile=opencode_profile(cfg))
         config = home / ("codex/local.config.toml" if cfg.harness.name == "codex"
                          else "opencode/config/opencode/opencode.json")
         if harness_home is not None and not config.is_file():
@@ -778,7 +798,7 @@ def dispatch(cfg, output):
             return
         home = configure(absolute(cfg.configure.output_dir), url, cfg.model.served_name,
                          cfg.model.context_length, cfg.configure.force, cfg.model.output_tokens,
-                         cfg.model.get("temperature"))
+                         cfg.model.get("temperature"), opencode_profile=opencode_profile(cfg))
         print(f"Generated Codex and OpenCode configs in {home}")
         print("action=generate renders fresh local configs automatically unless harness.config is set.")
     elif cfg.action == "check":

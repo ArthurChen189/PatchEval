@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Create isolated local-model homes compatible with PatchEval's adapters."""
 
+import hashlib
 import json
 from pathlib import Path
 from urllib.parse import urlparse
@@ -17,7 +18,27 @@ OPENCODE_AGENTS = ("build", "plan", "general", "explore", "compaction", "summary
 OPENCODE_PERMISSION = {"*": "allow", "webfetch": "deny", "websearch": "deny", "codesearch": "deny"}
 
 
-def configure(output, base_url, model, context, force=False, output_tokens=16000, temperature=None):
+def profile_files(profile):
+    """Files of an OpenCode profile's config/ tree, keyed by path relative to the OpenCode config directory."""
+    source = Path(profile).expanduser().resolve() / "config"
+    if not source.is_dir():
+        raise ValueError(f"OpenCode profile has no config/ directory: {source}")
+    files = {}
+    for item in sorted(source.rglob("*")):
+        if item.is_symlink():
+            raise ValueError(f"OpenCode profile must not contain symlinks: {item}")
+        if item.is_file():
+            relative = item.relative_to(source)
+            if relative.as_posix() in ("opencode.json", "opencode.jsonc", "config.json"):
+                raise ValueError(f"OpenCode profile must not replace the rendered config: {item}")
+            files[relative] = item.read_bytes()
+    if not files:
+        raise ValueError(f"OpenCode profile is empty: {source}")
+    return source.parent, files
+
+
+def configure(output, base_url, model, context, force=False, output_tokens=16000, temperature=None,
+              opencode_profile=None):
     parsed = urlparse(base_url)
     if parsed.scheme not in ("http", "https") or not parsed.hostname:
         raise ValueError("base URL must be an HTTP(S) URL")
@@ -67,6 +88,15 @@ supports_websockets = false
     if temperature is not None:
         opencode["provider"]["vllm"]["models"][model]["temperature"] = True
         opencode["agent"] = {name: {"temperature": temperature} for name in OPENCODE_AGENTS}
+    # An OpenCode profile (rules in AGENTS.md, skills/) is copied verbatim into the
+    # global config directory, which agents/opencode.sh copies into the container.
+    profile, extra = (None, {}) if opencode_profile is None else profile_files(opencode_profile)
+    extra = {output / "opencode/config/opencode" / relative: data for relative, data in extra.items()}
+    profile_record = None if profile is None else {
+        "name": profile.name, "source": str(profile),
+        "files": {str(path.relative_to(output / "opencode/config/opencode")): hashlib.sha256(data).hexdigest()
+                  for path, data in extra.items()},
+    }
     files = {
         output / "codex/config.toml": config,
         output / "codex/local.config.toml": config,
@@ -77,18 +107,22 @@ supports_websockets = false
             "output_tokens": output_tokens, "temperature": temperature,
             "opencode_version_validated": OPENCODE_VERSION,
             "web_tools": {"codex": "web_search disabled", "opencode": OPENCODE_PERMISSION},
+            "opencode_profile": profile_record,
             "enforcement": {
                 "codex": "vLLM --override-generation-config (max_new_tokens, default temperature)",
                 "opencode": "limit.output and agent.*.temperature; vLLM max_new_tokens also caps",
             },
         }, indent=2) + "\n",
     }
-    existing = [str(path) for path in files if path.exists()]
+    existing = [str(path) for path in [*files, *extra] if path.exists()]
     if existing and not force:
         raise FileExistsError("Refusing to overwrite configs; use --force: " + ", ".join(existing))
     for path, content in files.items():
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
+    for path, data in extra.items():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
     (output / "opencode/data").mkdir(parents=True, exist_ok=True)
     return output
 

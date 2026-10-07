@@ -1,3 +1,4 @@
+import hashlib
 import importlib.util
 import io
 import json
@@ -67,6 +68,51 @@ class ConfigTests(unittest.TestCase):
             rendered = json.loads((output / 'opencode/config/opencode/opencode.json').read_text())
             self.assertNotIn('agent', rendered)
             self.assertNotIn('temperature', rendered['provider']['vllm']['models']['model'])
+
+    def test_opencode_profile_is_copied_with_hashes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            profile = Path(directory) / 'secpatch'
+            (profile / 'config/skills/demo/references').mkdir(parents=True)
+            (profile / 'config/AGENTS.md').write_text('# rules\n')
+            (profile / 'config/skills/demo/SKILL.md').write_bytes(b'---\nname: demo\n---\nbody\n')
+            (profile / 'config/skills/demo/references/x.md').write_text('ref\n')
+            (profile / 'README.md').write_text('provenance, not copied\n')
+            output = configs.configure(Path(directory) / 'out', 'http://host/v1', 'model', 65536,
+                                       opencode_profile=profile)
+            home = output / 'opencode/config/opencode'
+            self.assertEqual((home / 'AGENTS.md').read_text(), '# rules\n')
+            self.assertEqual((home / 'skills/demo/SKILL.md').read_bytes(), b'---\nname: demo\n---\nbody\n')
+            self.assertFalse((home / 'README.md').exists())
+            # The rendered opencode.json is unchanged by a profile.
+            rendered = json.loads((home / 'opencode.json').read_text())
+            self.assertEqual(rendered['permission'], configs.OPENCODE_PERMISSION)
+            manifest = json.loads((output / 'config-manifest.json').read_text())['opencode_profile']
+            self.assertEqual(manifest['name'], 'secpatch')
+            self.assertEqual(set(manifest['files']), {'AGENTS.md', 'skills/demo/SKILL.md',
+                                                      'skills/demo/references/x.md'})
+            self.assertEqual(manifest['files']['AGENTS.md'], hashlib.sha256(b'# rules\n').hexdigest())
+            with self.assertRaises(FileExistsError):
+                configs.configure(Path(directory) / 'out', 'http://host/v1', 'model', 65536,
+                                  opencode_profile=profile)
+            configs.configure(Path(directory) / 'out', 'http://host/v1', 'model', 65536, force=True,
+                              opencode_profile=profile)
+            plain = configs.configure(Path(directory) / 'plain', 'http://host/v1', 'model', 65536)
+            self.assertIsNone(json.loads((plain / 'config-manifest.json').read_text())['opencode_profile'])
+            self.assertFalse((plain / 'opencode/config/opencode/AGENTS.md').exists())
+
+    def test_invalid_opencode_profiles_are_rejected_before_writing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            missing = Path(directory) / 'missing'
+            clash = Path(directory) / 'clash'
+            (clash / 'config').mkdir(parents=True)
+            (clash / 'config/opencode.json').write_text('{}')
+            empty = Path(directory) / 'empty'
+            (empty / 'config').mkdir(parents=True)
+            for profile in (missing, clash, empty):
+                output = Path(directory) / f'out-{profile.name}'
+                with self.assertRaises(ValueError):
+                    configs.configure(output, 'http://host/v1', 'model', 65536, opencode_profile=profile)
+                self.assertFalse(output.exists())
 
 
 class ProtocolTests(unittest.TestCase):

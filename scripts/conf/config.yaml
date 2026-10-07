@@ -82,7 +82,7 @@ hydra:
     # <paths.runs>/<model>_<Harness>_Max-output-token=<cap>/<time>-<name>, e.g.
     # Qwen3.8-27B_Codex_Max-output-token=16k/<time>-generate-codex-<label>. Evaluations and resumes
     # join the group of the run they act on; serve/setup go to <model>_vLLM-serving/.
-    dir: ${absolute:${paths.runs}}/${run_group:${paths.runs},${action},${model.served_name},${harness.name},${model.output_tokens},${evaluation.run_dir},${generation.resume_dir}}/${now:%Y%m%d_%H%M%S_%f}-${run_name:${action},${harness.name},${label},${evaluation.run_dir},${generation.resume_dir}}
+    dir: ${absolute:${paths.runs}}/${run_group:${paths.runs},${action},${model.served_name},${harness.name},${model.output_tokens},${evaluation.run_dir},${generation.resume_dir},${oc.select:harness.profile,null}}/${now:%Y%m%d_%H%M%S_%f}-${run_name:${action},${harness.name},${label},${evaluation.run_dir},${generation.resume_dir}}
   sweep:
     dir: ${absolute:${paths.runs}}/multirun/${now:%Y%m%d_%H%M%S_%f}
     subdir: ${hydra.job.num}

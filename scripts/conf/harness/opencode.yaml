@@ -7,3 +7,6 @@ binary: ${oc.env:OPENCODE_BIN,${repo:}/third_party/opencode/1.18.31/opencode-lin
 # Keep in sync with OPENCODE_PINNED_VERSION in patcheval/exp_agent/agents/opencode.sh.
 version: 1.18.31
 config: null
+# Optional rules/skills profile: <dir>/config/ is copied into the rendered OpenCode
+# config directory (e.g. harness=opencode_secpatch). null renders the plain config.
+profile: null

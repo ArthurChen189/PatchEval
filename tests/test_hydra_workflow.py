@@ -331,6 +331,46 @@ class HydraWorkflowTests(unittest.TestCase):
             record = json.loads((Path(tmp) / 'single job/harness-version.json').read_text())
             self.assertEqual((record['harness'], record['opencode_version_validated']), ('opencode', '1.18.31'))
 
+    def test_opencode_security_profile_is_rendered_and_grouped(self):
+        cfg = config('action=generate', 'experiment=smoke', 'harness=opencode_secpatch', 'server.host=127.0.0.1')
+        self.assertEqual(cfg.harness.name, 'opencode')
+        self.assertEqual(Path(cfg.harness.profile), ROOT / 'harness_profiles/opencode/secpatch')
+        self.assertIsNone(config('harness=opencode').harness.profile)
+        self.assertEqual(workflow.run_group('/tmp', 'generate', 'Qwen/Qwen3.8-27B', 'opencode', 16000,
+                                            None, None, cfg.harness.profile),
+                         'Qwen3.8-27B_OpenCode-secpatch_Max-output-token=16k')
+        cfg.harness.binary = '/bin/true'
+        cfg.generation.samples = 1
+        with tempfile.TemporaryDirectory(prefix='profile run ') as tmp:
+            cfg.paths.runs = tmp
+            with patch.object(workflow.subprocess, 'run') as execute, \
+                 patch.object(workflow.subprocess, 'check_output', return_value='1.18.31\n'), \
+                 patch.object(workflow, 'network_preflight'):
+                workflow.dispatch(cfg, Path(tmp) / 'job')
+            config_file = Path(execute.call_args.kwargs['env']['OPENCODE_CONFIG'])
+            home = config_file.parent
+            source = ROOT / 'harness_profiles/opencode/secpatch/config'
+            self.assertEqual((home / 'AGENTS.md').read_bytes(), (source / 'AGENTS.md').read_bytes())
+            skill = 'skills/security-patch/SKILL.md'
+            self.assertEqual((home / skill).read_bytes(), (source / skill).read_bytes())
+            self.assertFalse((home / 'README.md').exists())
+            manifest = json.loads((Path(tmp) / 'job/harnesses/config-manifest.json').read_text())
+            self.assertEqual(manifest['opencode_profile']['name'], 'secpatch')
+            # Evaluations and resumes of a profile run join its group via resolved.yaml.
+            legacy = Path(tmp) / 'hydra/profile-run'
+            legacy.mkdir(parents=True)
+            OmegaConf.save(OmegaConf.create({'harness': {'name': 'opencode', 'profile': str(source.parent)},
+                                             'model': {'served_name': 'Qwen/Qwen3.8-27B', 'output_tokens': 16000}}),
+                           legacy / 'resolved.yaml')
+            self.assertEqual(workflow.run_group(tmp, 'evaluate', 'Qwen/Qwen3.8-27B', 'codex', 16000, str(legacy)),
+                             'Qwen3.8-27B_OpenCode-secpatch_Max-output-token=16k')
+        # A profile only applies to rendered OpenCode configs.
+        for overrides in (('harness=codex', '+harness.profile=/tmp'),
+                          ('harness=opencode_secpatch', 'harness.config=/tmp/opencode.json'),
+                          ('harness=opencode', 'harness.profile=/nonexistent-profile')):
+            with self.assertRaises(ValueError):
+                workflow.validate(config('action=generate', 'server.host=127.0.0.1', *overrides))
+
     def test_codex_is_pinned_to_the_vendored_release(self):
         cfg = config('harness=codex')
         self.assertEqual(str(cfg.harness.version), '0.155.0')

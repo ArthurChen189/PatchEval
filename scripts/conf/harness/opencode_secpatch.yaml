@@ -1,0 +1,8 @@
+# Pinned OpenCode plus the security-patch rules and skills adapted from
+# codex-security and deepsec (harness_profiles/opencode/secpatch/README.md).
+# Runs are grouped as <model>_OpenCode-secpatch_Max-output-token=<cap>.
+defaults:
+  - opencode
+  - _self_
+
+profile: ${repo:}/harness_profiles/opencode/secpatch

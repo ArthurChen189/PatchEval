@@ -538,6 +538,25 @@ and installs of the target package), and `python -m scripts.infer.pass_at_k
 --restrict PASS_AT_K_JSON --exclude-cves FILE --out DIR` rescores an evaluation
 without the excluded CVEs.
 
+### OpenCode security-patch profile
+
+`harness=opencode_secpatch` is the pinned OpenCode with security-patching rules and skills adapted from codex-security
+and deepsec (Apache-2.0), stored in `harness_profiles/opencode/secpatch/` (see its `README.md` and `NOTICE.md`).
+
+- **Rendering.** `harness.profile` names a directory whose `config/` tree is copied byte for byte into the rendered
+  `harnesses/opencode/config/opencode/`. The tree holds `AGENTS.md`, which is always in the system prompt, and
+  `skills/security-patch/` (SKILL.md plus per-CWE and patch-review references), which is loaded with the `skill`
+  tool.
+- **Adapter.** `agents/opencode.sh` already copies that directory into the container as `$XDG_CONFIG_HOME/opencode`,
+  so the adapter needs no change.
+- **Records.** `config-manifest.json` records each file's SHA-256. Runs are grouped as
+  `<model>_OpenCode-secpatch_Max-output-token=<cap>`.
+- **What stays the same.** The task prompt, permissions, and offline network are unchanged.
+- **Other harnesses.** `harness.profile` is rejected for Codex, TraeCLI, or a custom `harness.config`.
+- **New profiles.** Add a directory with a `config/` tree and a harness YAML with `defaults: [opencode, _self_]`
+  and `profile: ${repo:}/harness_profiles/opencode/<name>`.
+- **Outside PatchEval** (for example CWEBench), copy `config/` into the agent's `$XDG_CONFIG_HOME/opencode/`.
+
 ### Token usage and cost inputs
 
 `scripts/infer/token_usage.py` (stdlib only) normalizes per-task usage for both
