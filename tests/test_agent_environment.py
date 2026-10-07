@@ -1,4 +1,4 @@
-"""Agent-environment features: project Python env, vendored ripgrep, continue-on-length."""
+"""Agent-environment features: project Python env, vendored ripgrep, continue-on-length, secpatch2."""
 import argparse
 import asyncio
 import hashlib
@@ -353,6 +353,23 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
 
 
 class WorkflowTests(unittest.TestCase):
+    def test_secpatch2_composes_and_exports_its_features(self):
+        cfg = config("action=generate", "harness=opencode_secpatch2", "server.host=127.0.0.1")
+        self.assertEqual((cfg.harness.name, cfg.harness.continue_on_length), ("opencode", 2))
+        self.assertEqual(Path(cfg.harness.profile), ROOT / "harness_profiles/opencode/secpatch2")
+        self.assertEqual(workflow.run_group("/tmp", "generate", "Qwen/Qwen3.8-27B", "opencode", 16000,
+                                            None, None, cfg.harness.profile),
+                         "Qwen3.8-27B_OpenCode-secpatch2_Max-output-token=16k")
+        cfg.dry_run = True
+        self.assertEqual(workflow.agent_environment(cfg),
+                         {"RIPGREP_BIN": str(ROOT / "third_party/ripgrep/15.1.0/rg"),
+                          "OPENCODE_CONTINUE_ON_LENGTH": "2", "PYTHON_ENV": "true"})
+        plain = config("action=generate", "harness=opencode", "server.host=127.0.0.1")
+        self.assertEqual(workflow.agent_environment(plain)["OPENCODE_CONTINUE_ON_LENGTH"], "0")
+        codex = config("action=generate", "harness=codex", "server.host=127.0.0.1")
+        self.assertEqual(workflow.agent_environment(codex),
+                         {"RIPGREP_BIN": "none", "OPENCODE_CONTINUE_ON_LENGTH": "0", "PYTHON_ENV": "true"})
+
     def test_invalid_feature_settings_are_rejected(self):
         for overrides in (("harness=codex", "+harness.continue_on_length=1"),
                           ("harness=codex", "+harness.ripgrep=/bin/true"),
@@ -361,6 +378,23 @@ class WorkflowTests(unittest.TestCase):
                           ("harness=opencode", "generation.python_env=maybe")):
             with self.assertRaises(ValueError, msg=overrides):
                 workflow.validate(config("action=generate", "server.host=127.0.0.1", *overrides))
+
+    def test_resumed_old_invocations_keep_features_off(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "old"
+            target.mkdir()
+            stored = OmegaConf.to_container(config("action=generate", "harness=opencode",
+                                                   "server.host=127.0.0.1"))
+            for key in ("ripgrep", "continue_on_length", "profile"):
+                stored["harness"].pop(key)
+            stored["generation"].pop("python_env")
+            OmegaConf.save(OmegaConf.create(stored), target / "resolved.yaml")
+            cfg = config("action=generate", "harness=opencode_secpatch2", "server.host=127.0.0.1",
+                         f"generation.resume_dir={target}")
+            workflow.prepare_resume(cfg, Path(tmp) / "new")
+            cfg.dry_run = True
+            self.assertEqual(workflow.agent_environment(cfg),
+                             {"RIPGREP_BIN": "none", "OPENCODE_CONTINUE_ON_LENGTH": "0", "PYTHON_ENV": "false"})
 
     def test_agent_environment_is_recorded_and_checked_on_resume(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -374,3 +408,39 @@ class WorkflowTests(unittest.TestCase):
             workflow.check_resume_environment(tmp, record)
             with self.assertRaises(ValueError):
                 workflow.check_resume_environment(tmp, {**record, "continue_on_length": 0})
+
+
+class Secpatch2ProfileTests(unittest.TestCase):
+    def setUp(self):
+        path = ROOT / "harness_profiles/opencode/secpatch2/check_profile.py"
+        spec = importlib.util.spec_from_file_location("check_profile", path)
+        self.check = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.check)
+        self.profile = path.parent
+
+    def test_profile_is_well_formed_benchmark_agnostic_and_small(self):
+        self.assertEqual(self.check.check_layout(self.profile), [])
+        self.assertEqual(self.check.check_lint(self.profile), [])
+        errors, summary = self.check.check_budget(self.profile)
+        self.assertEqual(errors, [])  # enforced only with the real tokenizer (vLLM env); estimates warn
+        if summary["method"].startswith("tokenizer:"):
+            self.assertLess(summary["always_on"], 450)
+
+    def test_lint_flags_benchmark_terms_and_identifiers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp) / "config"
+            config_dir.mkdir()
+            (config_dir / "AGENTS.md").write_text("Write /workspace/fix.patch for CVE-2020-12345.\n")
+            self.assertEqual(len(self.check.check_lint(Path(tmp))), 2)
+
+    def test_opencode_lists_the_skill_from_a_nexus_style_config(self):
+        binary = ROOT / "third_party/opencode/1.18.31/opencode-linux-x64"
+        if not binary.is_file():
+            self.skipTest("OpenCode binary not extracted")
+        errors, details = self.check.check_install(self.profile, str(binary))
+        self.assertEqual(errors, [])
+        self.assertIn("security-patch", details["skills"])
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -557,6 +557,22 @@ and deepsec (Apache-2.0), stored in `harness_profiles/opencode/secpatch/` (see i
 - **New profiles.** Add a directory with a `config/` tree and a harness YAML with `defaults: [opencode, _self_]`
   and `profile: ${repo:}/harness_profiles/opencode/<name>`.
 - **Outside PatchEval** (for example CWEBench), copy `config/` into the agent's `$XDG_CONFIG_HOME/opencode/`.
+
+`harness=opencode_secpatch2` (`harness_profiles/opencode/secpatch2/`) is the second version.
+- **Origin.** It was rewritten after a failure analysis of v1 on val46 (report
+  `analysis_reports/*-opencode-secpatch2-val46/`).
+- **Content.** It is benchmark-agnostic so it also serves nexus cyber-training tasks:
+  - no PatchEval paths or CVE ids;
+  - per-CWE-family class files sized for a 30k-token context;
+  - C/C++/Rust/Java coverage.
+- **Extra setting.** It sets `continue_on_length: 2`.
+- **Checks.** `harness_profiles/opencode/secpatch2/check_profile.py` (run it with the vLLM venv's Python for real
+  token counts) checks:
+  - layout;
+  - a lint for benchmark terms and identifiers;
+  - token budgets;
+  - an offline OpenCode install with a nexus-style config.
+- **Usage outside PatchEval.** Its README documents installation for cyber-train. v1 stays unchanged for
   reproducibility.
 
 ### Agent environment: ripgrep, project Python env, continue-on-length (2026-10-06)

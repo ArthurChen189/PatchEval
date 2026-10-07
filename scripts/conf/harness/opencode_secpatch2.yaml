@@ -1,0 +1,9 @@
+# Pinned OpenCode plus the secpatch2 security-patching profile (harness_profiles/opencode/secpatch2/):
+# benchmark-agnostic rules and skills, and continue-on-length for responses that end at the
+# output-token limit. Runs are grouped as <model>_OpenCode-secpatch2_Max-output-token=<cap>.
+defaults:
+  - opencode
+  - _self_
+
+profile: ${repo:}/harness_profiles/opencode/secpatch2
+continue_on_length: 2
